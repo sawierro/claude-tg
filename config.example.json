@@ -1,0 +1,10 @@
+{
+    "telegram_token": "",
+    "allowed_chat_ids": [],
+    "default_work_dir": ".",
+    "claude_path": "claude.cmd",
+    "claude_flags": [],
+    "max_message_length": 4000,
+    "session_timeout_hours": 24,
+    "subprocess_timeout_minutes": 30
+}

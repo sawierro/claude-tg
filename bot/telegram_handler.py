@@ -1,0 +1,631 @@
+import json
+import logging
+import functools
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+from bot.config import Config
+from bot.session_manager import SessionManager
+from bot.message_formatter import (
+    format_notification,
+    format_session_list,
+    format_error,
+    escape_markdown_v2,
+    split_message,
+)
+from bot.external_sessions import list_external_sessions, find_session_by_query
+
+logger = logging.getLogger(__name__)
+
+
+async def _safe_reply(message, text: str, **kwargs):
+    """Send message with MarkdownV2, fallback to plain text on parse error."""
+    try:
+        return await message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN_V2, **kwargs
+        )
+    except Exception as e:
+        if "can't parse entities" in str(e).lower():
+            logger.warning("MarkdownV2 parse failed, falling back to plain text")
+            # Strip markdown escapes for readability
+            plain = text.replace("\\", "")
+            return await message.reply_text(plain, **kwargs)
+        raise
+
+
+async def _safe_send(bot, chat_id: int, text: str, **kwargs):
+    """Send message with MarkdownV2, fallback to plain text on parse error."""
+    try:
+        return await bot.send_message(
+            chat_id, text, parse_mode=ParseMode.MARKDOWN_V2, **kwargs
+        )
+    except Exception as e:
+        if "can't parse entities" in str(e).lower():
+            logger.warning("MarkdownV2 parse failed, falling back to plain text")
+            plain = text.replace("\\", "")
+            return await bot.send_message(chat_id, plain, **kwargs)
+        raise
+
+
+def authorized(func):
+    """Decorator: only allow whitelisted chat IDs."""
+
+    @functools.wraps(func)
+    async def wrapper(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ):
+        config: Config = context.bot_data["config"]
+        chat_id = update.effective_chat.id
+
+        # Registration mode: empty whitelist → auto-register first user
+        if not config.allowed_chat_ids:
+            config.allowed_chat_ids.append(chat_id)
+            config.save()
+            logger.info("Auto-registered chat_id %d", chat_id)
+            await update.message.reply_text(
+                f"Регистрация завершена\\! Ваш chat\\_id: `{chat_id}`\n"
+                f"Отправьте /help для списка команд\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+        if chat_id not in config.allowed_chat_ids:
+            logger.warning("Unauthorized access attempt from chat_id %d", chat_id)
+            return
+
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
+
+
+@authorized
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command."""
+    await update.message.reply_text(
+        "*Claude\\-TG Bot*\n\n"
+        "Удалённое управление сессиями Claude Code\\.\n\n"
+        "Команды: /help",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+@authorized
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command."""
+    text = (
+        "*Команды:*\n\n"
+        "`/connect` \\- Подключиться к терминалу\n"
+        "`/new <name> [path] [prompt]` \\- Новая сессия\n"
+        "`/sessions` \\- Активные сессии бота\n"
+        "`/stop <name>` \\- Отключить сессию\n"
+        "`/sync` \\- Записать сводку в файл для терминала\n"
+        "`/cancel` \\- Прервать текущую работу\n"
+        "`/help` \\- Эта справка\n\n"
+        "*Основной сценарий:*\n"
+        "1\\. Запустите `claude` в терминале\n"
+        "2\\. `/connect` \\- выберите сессию\n"
+        "3\\. Ответы Claude дублируются в телегу\n"
+        "4\\. Отправьте сообщение для управления"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+@authorized
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /new <name> [path] [prompt] command."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Использование: `/new <name> [path] [prompt]`\n"
+            "Пример: `/new myproject . Исправь баг в auth\\.py`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    name = args[0]
+
+    # Parse: /new <name> [prompt...]
+    # If second arg is an existing directory, use it as work_dir
+    # Otherwise everything after name is the prompt
+    if len(args) >= 2:
+        candidate_path = Path(args[1]).resolve()
+        if candidate_path.is_dir():
+            work_dir = str(candidate_path)
+            prompt = " ".join(args[2:]) if len(args) >= 3 else f"You are working on project '{name}'."
+        else:
+            work_dir = config.default_work_dir
+            prompt = " ".join(args[1:])
+    else:
+        work_dir = config.default_work_dir
+        prompt = f"You are working on project '{name}'."
+
+    # Resolve work_dir
+    work_dir_path = Path(work_dir).resolve()
+    if not work_dir_path.is_dir():
+        await update.message.reply_text(
+            format_error(f"Directory not found: {work_dir}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # Send "processing" message
+    processing_msg = await update.message.reply_text(
+        f"\u23f3 Запуск сессии *{escape_markdown_v2(name)}*\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        response = await session_mgr.create_session(
+            name, str(work_dir_path), prompt
+        )
+    except ValueError as e:
+        await processing_msg.edit_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+    except Exception as e:
+        logger.exception("Failed to create session")
+        await processing_msg.edit_text(
+            format_error(f"Failed to create session: {e}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # Format and send result
+    status = "error" if response.error else "waiting"
+    notification = format_notification(
+        name, str(work_dir_path), response, status
+    )
+
+    chunks = split_message(notification, config.max_message_length)
+    last_msg = None
+    for chunk in chunks:
+        last_msg = await _safe_reply(update.message, chunk)
+
+    # Update session with the last message ID for reply routing
+    if last_msg and response.session_id:
+        await session_mgr.update_tg_message(response.session_id, last_msg.message_id)
+
+    # Delete the "processing" message
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+
+@authorized
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sessions command."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    sessions = await session_mgr.list_sessions()
+    text = format_session_list(sessions)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+@authorized
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stop <name> command."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: `/stop <name>`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    name = context.args[0]
+    try:
+        await session_mgr.stop_session_by_name(name)
+        await update.message.reply_text(
+            f"\U0001f7e2 Сессия `{escape_markdown_v2(name)}` остановлена\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except ValueError as e:
+        await update.message.reply_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+
+@authorized
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cancel — kill all running sessions."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    sessions = await session_mgr.list_sessions()
+    running = [s for s in sessions if s["status"] == "running"]
+
+    if not running:
+        await update.message.reply_text("Нет активных процессов для отмены\\.",
+                                         parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    for s in running:
+        await session_mgr.stop_session(s["id"])
+
+    names = ", ".join(s["name"] for s in running)
+    await update.message.reply_text(
+        f"Остановлено: `{escape_markdown_v2(names)}`",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+@authorized
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sync — write conversation summary to the session's work_dir."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    active = await session_mgr.list_sessions()
+    waiting = [s for s in active if s["status"] == "waiting"]
+
+    if not waiting:
+        await update.message.reply_text(
+            "Нет активных сессий для синхронизации\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    if len(waiting) > 1:
+        keyboard = [
+            [InlineKeyboardButton(s["name"], callback_data=f"sync:{s['id']}")]
+            for s in waiting
+        ]
+        await update.message.reply_text(
+            "Выберите сессию для синхронизации:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    session = waiting[0]
+    await _do_sync(update.message, session_mgr, session)
+
+
+async def _do_sync(message, session_mgr: SessionManager, session: dict) -> None:
+    """Execute sync and send confirmation."""
+    try:
+        file_path = await session_mgr.sync_session(session["id"])
+    except ValueError as e:
+        await _safe_reply(message, format_error(str(e)))
+        return
+    except Exception as e:
+        logger.exception("Sync failed")
+        await _safe_reply(message, format_error(f"Sync failed: {e}"))
+        return
+
+    esc_name = escape_markdown_v2(session["name"])
+    esc_path = escape_markdown_v2(file_path)
+    await _safe_reply(
+        message,
+        f"\u2705 Синхронизация `{esc_name}` завершена\\.\n\n"
+        f"Файл: `{esc_path}`\n\n"
+        f"В терминале Claude прочитает его автоматически "
+        f"или выполните:\n`cat \\.claude\\-tg\\-sync\\.md`",
+    )
+
+
+@authorized
+async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /connect — show terminal sessions from all providers as inline buttons."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    all_sessions = []
+    for provider in session_mgr._providers.values():
+        all_sessions.extend(provider.list_sessions())
+
+    if not all_sessions:
+        await update.message.reply_text(
+            "Нет активных сессий в терминалах\\.\n"
+            "Запустите `claude` или `codex` в терминале\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    PROVIDER_ICON = {"claude": "\U0001f7e3", "codex": "\U0001f7e2"}  # 🟣 / 🟢
+
+    keyboard = []
+    for s in all_sessions:
+        icon = PROVIDER_ICON.get(s.provider, "\u26aa")
+        label = s.slug or s.session_id[:8]
+        short_cwd = Path(s.cwd).name if s.cwd else "?"
+        btn_text = f"{icon} {label} | {short_cwd}"
+        # Encode provider in callback data
+        keyboard.append(
+            [InlineKeyboardButton(
+                btn_text,
+                callback_data=f"attach:{s.provider}:{s.session_id}"
+            )]
+        )
+
+    await update.message.reply_text(
+        "*Выберите сессию для подключения:*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+@authorized
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route text messages to the appropriate session."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+    text = update.message.text
+
+    if not text:
+        return
+
+    session = None
+
+    # If replying to a bot message, find the session
+    if update.message.reply_to_message:
+        reply_msg_id = update.message.reply_to_message.message_id
+        session = await session_mgr.get_session_by_tg_message(reply_msg_id)
+
+    # If not a reply, try remembered session, then active sessions
+    if not session:
+        # Check if user has a remembered active session
+        remembered_id = context.user_data.get("active_session_id")
+        if remembered_id:
+            from bot import db as db_module
+            remembered = await db_module.get_session(session_mgr.conn, remembered_id)
+            if remembered and remembered["status"] in ("running", "waiting"):
+                session = remembered
+
+    if not session:
+        active = await session_mgr.list_sessions()
+        waiting = [s for s in active if s["status"] == "waiting"]
+
+        if len(waiting) == 1:
+            session = waiting[0]
+        elif len(waiting) > 1:
+            keyboard = [
+                [InlineKeyboardButton(s["name"], callback_data=f"resume:{s['id']}")]
+                for s in waiting
+            ]
+            await update.message.reply_text(
+                "Выберите сессию:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            context.user_data["pending_prompt"] = text
+            return
+        else:
+            await update.message.reply_text(
+                "Нет активных сессий\\. `/connect` или `/new`",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+    # Resume the session
+    await _resume_and_reply(update, context, session, text)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard callbacks."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("attach:"):
+        await _handle_attach_callback(query, context)
+    elif data.startswith("resume:"):
+        await _handle_resume_callback(update, query, context)
+    elif data.startswith("sync:"):
+        await _handle_sync_callback(query, context)
+
+
+async def _handle_sync_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle sync session selection callback."""
+    session_id = query.data.split(":", 1)[1]
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    from bot import db as db_module
+
+    session = await db_module.get_session(session_mgr.conn, session_id)
+    if not session:
+        await query.edit_message_text(
+            "Сессия не найдена\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    await query.edit_message_text(
+        f"\u23f3 Синхронизация *{escape_markdown_v2(session['name'])}*\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    await _do_sync(query.message, session_mgr, session)
+
+
+async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle attach button press — connect to a terminal session."""
+    # Format: attach:provider:session_id
+    parts = query.data.split(":", 2)
+    if len(parts) == 3:
+        provider_name, session_id = parts[1], parts[2]
+    else:
+        # Legacy format: attach:session_id
+        provider_name, session_id = "claude", parts[1]
+
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    try:
+        provider = session_mgr.get_provider(provider_name)
+    except ValueError:
+        await query.edit_message_text(
+            format_error(f"Провайдер '{provider_name}' не подключен\\."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    ext = provider.find_session(session_id)
+    if not ext:
+        await query.edit_message_text(
+            format_error("Сессия не найдена\\. Возможно, терминал закрыт\\."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    name = ext.slug or ext.session_id[:8]
+
+    try:
+        await session_mgr.import_external_session(
+            ext.session_id, name, ext.cwd, provider_name=provider_name
+        )
+    except ValueError as e:
+        await query.edit_message_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    ICON = {"claude": "\U0001f7e3", "codex": "\U0001f7e2"}
+    icon = ICON.get(provider_name, "\U0001f517")
+
+    # Remember this session for future messages
+    context.user_data["active_session_id"] = ext.session_id
+
+    await query.edit_message_text(
+        f"{icon} Подключено: `{escape_markdown_v2(name)}`\n"
+        f"\U0001f4c1 `{escape_markdown_v2(ext.cwd)}`\n\n"
+        f"Отправьте сообщение для продолжения\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _handle_resume_callback(
+    update: Update, query, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle session selection for message routing."""
+    session_id = query.data.split(":", 1)[1]
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    from bot import db as db_module
+
+    session = await db_module.get_session(session_mgr.conn, session_id)
+    if not session:
+        await query.edit_message_text("Сессия не найдена\\.",
+                                       parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    prompt = context.user_data.get("pending_prompt", "")
+    if not prompt:
+        await query.edit_message_text("Нет сообщения для отправки\\.",
+                                       parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    await query.edit_message_text(
+        f"\u23f3 Отправляю в *{escape_markdown_v2(session['name'])}*\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    await _resume_and_reply(update, context, session, prompt, edit_message=query.message)
+
+
+async def _resume_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: dict,
+    prompt: str,
+    edit_message=None,
+) -> None:
+    """Resume a session and send the response to Telegram."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+
+    # Send or edit processing message
+    if edit_message:
+        processing_msg = edit_message
+        await processing_msg.edit_text(
+            f"\u23f3 Обработка в *{escape_markdown_v2(session['name'])}*\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    else:
+        processing_msg = await update.message.reply_text(
+            f"\u23f3 Обработка в *{escape_markdown_v2(session['name'])}*\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+    try:
+        response = await session_mgr.resume_session(session["id"], prompt)
+    except Exception as e:
+        logger.exception("Failed to resume session")
+        await processing_msg.edit_text(
+            format_error(f"Resume failed: {e}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    logger.info(
+        "Claude response: session=%s text=%s error=%s",
+        response.session_id[:8] if response.session_id else "?",
+        response.text[:100] if response.text else "(empty)",
+        response.error,
+    )
+
+    # Delete processing message
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    status = "error" if response.error else "waiting"
+    notification = format_notification(
+        session["name"], session["work_dir"], response, status
+    )
+
+    chunks = split_message(notification, config.max_message_length)
+    last_msg = None
+    chat_id = update.effective_chat.id
+
+    for chunk in chunks:
+        last_msg = await _safe_send(context.bot, chat_id, chunk)
+
+    # Update session with last message ID
+    if last_msg:
+        await session_mgr.update_tg_message(session["id"], last_msg.message_id)
+
+
+def setup_handlers(app: Application, session_mgr: SessionManager, config: Config) -> None:
+    """Register all handlers with the Telegram application."""
+    app.bot_data["config"] = config
+    app.bot_data["session_mgr"] = session_mgr
+
+    # Set up watcher callback — forwards terminal responses to Telegram
+    async def on_terminal_response(session_id: str, session_name: str, text: str):
+        chat_ids = config.allowed_chat_ids
+        if not chat_ids:
+            return
+
+        esc_name = escape_markdown_v2(session_name)
+        esc_text = escape_markdown_v2(text)
+        notification = (
+            f"\U0001f4e1 *Терминал* \\| `{esc_name}`\n\n"
+            f"{esc_text}"
+        )
+        chunks = split_message(notification, config.max_message_length)
+
+        for chat_id in chat_ids:
+            for chunk in chunks:
+                await _safe_send(app.bot, chat_id, chunk)
+
+    session_mgr.set_watcher_callback(on_terminal_response)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("connect", cmd_connect))
+    app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Telegram handlers registered")
