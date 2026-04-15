@@ -92,6 +92,8 @@ class SessionManager:
         provider_name = session.get("provider", "claude")
         provider = self.get_provider(provider_name)
 
+        wsl_distro = session.get("wsl_distro", "") or None
+
         await db.update_session_status(self.conn, session_id, "running")
 
         watcher = self._watchers.get(session_id)
@@ -100,7 +102,8 @@ class SessionManager:
 
         try:
             response = await provider.run(
-                prompt, session["work_dir"], session_id=session_id
+                prompt, session["work_dir"], session_id=session_id,
+                wsl_distro=wsl_distro,
             )
         except Exception:
             await db.update_session_status(self.conn, session_id, "error")
@@ -143,7 +146,8 @@ class SessionManager:
         await self.stop_session(session["id"])
 
     async def import_external_session(
-        self, session_id: str, name: str, work_dir: str, provider_name: str = "claude"
+        self, session_id: str, name: str, work_dir: str,
+        provider_name: str = "claude", wsl_distro: str = "",
     ) -> None:
         """Import an external session into the bot's DB."""
         existing = await db.get_session(self.conn, session_id)
@@ -162,10 +166,15 @@ class SessionManager:
                 name = f"{name}-tg"
 
         await db.create_session(
-            self.conn, session_id, name, work_dir, provider=provider_name
+            self.conn, session_id, name, work_dir,
+            provider=provider_name, wsl_distro=wsl_distro,
         )
         await db.update_session_status(self.conn, session_id, "waiting")
-        logger.info("Imported external session %s as '%s' (provider=%s)", session_id, name, provider_name)
+        logger.info(
+            "Imported external session %s as '%s' (provider=%s%s)",
+            session_id, name, provider_name,
+            f", wsl={wsl_distro}" if wsl_distro else "",
+        )
 
         self._start_watcher(session_id, name, provider_name)
 

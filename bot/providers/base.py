@@ -23,6 +23,7 @@ class ProviderSession:
     is_alive: bool
     slug: str
     provider: str  # "claude" or "codex"
+    wsl_distro: str = ""  # WSL distribution name, empty for native Windows/Linux
 
 
 class CLIProvider(ABC):
@@ -36,6 +37,7 @@ class CLIProvider(ABC):
         prompt: str,
         work_dir: str,
         session_id: str | None = None,
+        wsl_distro: str | None = None,
     ) -> ProviderResponse:
         """Run the CLI agent with a prompt. If session_id given, resume that session."""
         ...

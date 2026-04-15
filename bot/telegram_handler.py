@@ -338,15 +338,16 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard = []
     for s in all_sessions:
         icon = PROVIDER_ICON.get(s.provider, "\u26aa")
+        wsl_tag = f" \U0001f427{s.wsl_distro}" if s.wsl_distro else ""  # 🐧
         label = s.slug or s.session_id[:8]
         short_cwd = Path(s.cwd).name if s.cwd else "?"
-        btn_text = f"{icon} {label} | {short_cwd}"
-        # Encode provider in callback data
+        btn_text = f"{icon}{wsl_tag} {label} | {short_cwd}"
+        # Encode provider (and wsl distro if present) in callback data
+        cb_data = f"attach:{s.provider}:{s.session_id}"
+        if s.wsl_distro:
+            cb_data = f"attach:{s.provider}:wsl={s.wsl_distro}:{s.session_id}"
         keyboard.append(
-            [InlineKeyboardButton(
-                btn_text,
-                callback_data=f"attach:{s.provider}:{s.session_id}"
-            )]
+            [InlineKeyboardButton(btn_text, callback_data=cb_data)]
         )
 
     await update.message.reply_text(
@@ -447,13 +448,24 @@ async def _handle_sync_callback(query, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle attach button press — connect to a terminal session."""
-    # Format: attach:provider:session_id
-    parts = query.data.split(":", 2)
-    if len(parts) == 3:
-        provider_name, session_id = parts[1], parts[2]
+    # Formats:
+    #   attach:provider:session_id
+    #   attach:provider:wsl=Distro:session_id
+    raw = query.data
+    wsl_distro = ""
+
+    if ":wsl=" in raw:
+        # Parse WSL format: attach:provider:wsl=Distro:session_id
+        parts = raw.split(":", 3)
+        provider_name = parts[1]
+        wsl_distro = parts[2].removeprefix("wsl=")
+        session_id = parts[3]
     else:
-        # Legacy format: attach:session_id
-        provider_name, session_id = "claude", parts[1]
+        parts = raw.split(":", 2)
+        if len(parts) == 3:
+            provider_name, session_id = parts[1], parts[2]
+        else:
+            provider_name, session_id = "claude", parts[1]
 
     session_mgr: SessionManager = context.bot_data["session_mgr"]
 
@@ -475,10 +487,12 @@ async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     name = ext.slug or ext.session_id[:8]
+    wsl_distro = ext.wsl_distro or wsl_distro
 
     try:
         await session_mgr.import_external_session(
-            ext.session_id, name, ext.cwd, provider_name=provider_name
+            ext.session_id, name, ext.cwd,
+            provider_name=provider_name, wsl_distro=wsl_distro,
         )
     except ValueError as e:
         await query.edit_message_text(
@@ -488,12 +502,13 @@ async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
     ICON = {"claude": "\U0001f7e3", "codex": "\U0001f7e2"}
     icon = ICON.get(provider_name, "\U0001f517")
+    wsl_tag = f" \U0001f427 WSL/{escape_markdown_v2(wsl_distro)}" if wsl_distro else ""
 
     # Remember this session for future messages
     context.user_data["active_session_id"] = ext.session_id
 
     await query.edit_message_text(
-        f"{icon} Подключено: `{escape_markdown_v2(name)}`\n"
+        f"{icon}{wsl_tag} Подключено: `{escape_markdown_v2(name)}`\n"
         f"\U0001f4c1 `{escape_markdown_v2(ext.cwd)}`\n\n"
         f"Отправьте сообщение для продолжения\\.",
         parse_mode=ParseMode.MARKDOWN_V2,

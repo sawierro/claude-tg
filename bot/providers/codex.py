@@ -61,6 +61,7 @@ class CodexProvider(CLIProvider):
         prompt: str,
         work_dir: str,
         session_id: str | None = None,
+        wsl_distro: str | None = None,
     ) -> ProviderResponse:
         """Run Codex CLI and return parsed response."""
         cmd = self._build_command(prompt, session_id)

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     work_dir        TEXT NOT NULL,
     status          TEXT NOT NULL CHECK(status IN ('running','waiting','done','error')),
     provider        TEXT NOT NULL DEFAULT 'claude',
+    wsl_distro      TEXT NOT NULL DEFAULT '',
     last_tg_msg_id  INTEGER,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -52,6 +53,14 @@ async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
         await conn.commit()
         logger.info("Migrated: added provider column to sessions")
 
+    # Migration: add wsl_distro column if missing
+    try:
+        await conn.execute("SELECT wsl_distro FROM sessions LIMIT 1")
+    except Exception:
+        await conn.execute("ALTER TABLE sessions ADD COLUMN wsl_distro TEXT NOT NULL DEFAULT ''")
+        await conn.commit()
+        logger.info("Migrated: added wsl_distro column to sessions")
+
     logger.info("Database initialized at %s", db_path)
     return conn
 
@@ -62,11 +71,12 @@ async def create_session(
     name: str,
     work_dir: str,
     provider: str = "claude",
+    wsl_distro: str = "",
 ) -> None:
     """Insert a new session."""
     await conn.execute(
-        "INSERT INTO sessions (id, name, work_dir, status, provider) VALUES (?, ?, ?, 'running', ?)",
-        (session_id, name, work_dir, provider),
+        "INSERT INTO sessions (id, name, work_dir, status, provider, wsl_distro) VALUES (?, ?, ?, 'running', ?, ?)",
+        (session_id, name, work_dir, provider, wsl_distro),
     )
     await conn.commit()
 
