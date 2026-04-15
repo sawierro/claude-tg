@@ -278,17 +278,32 @@ class CodexProvider(CLIProvider):
 
     def _list_native_sessions(self) -> list[ProviderSession]:
         """List Codex sessions from native ~/.codex/."""
-        sessions = []
         logger.debug("Codex: scanning native %s (exists=%s)", CODEX_DIR, CODEX_DIR.exists())
 
-        # Try SQLite index first
-        db_path = CODEX_DIR / "sessions.db"
-        if not db_path.exists():
-            db_path = CODEX_DIR / "index.db"
-        if not db_path.exists():
-            # Fallback: scan session files
-            return self._list_sessions_from_files()
+        # Try new format first (state_*.sqlite → threads table)
+        sessions = self._read_threads_from_dir(CODEX_DIR)
+        if sessions:
+            return sessions
 
+        # Try legacy format (sessions.db / index.db → sessions table)
+        sessions = self._read_legacy_db(CODEX_DIR)
+        if sessions:
+            return sessions
+
+        # Fallback: scan session files
+        return self._list_sessions_from_files()
+
+    def _read_legacy_db(
+        self, codex_dir: Path, wsl_distro: str = "",
+    ) -> list[ProviderSession]:
+        """Read sessions from legacy sessions.db / index.db format."""
+        db_path = codex_dir / "sessions.db"
+        if not db_path.exists():
+            db_path = codex_dir / "index.db"
+        if not db_path.exists():
+            return []
+
+        sessions = []
         try:
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
@@ -323,11 +338,78 @@ class CodexProvider(CLIProvider):
                     is_alive=alive,
                     slug=name or sid[:8],
                     provider="codex",
+                    wsl_distro=wsl_distro,
                 ))
             conn.close()
         except Exception as e:
-            logger.warning("Failed to read Codex sessions DB: %s", e)
+            logger.warning("Failed to read legacy Codex DB %s: %s", db_path, e)
+
+        return sessions
+
+    @staticmethod
+    def _find_state_db(codex_dir: Path) -> Path | None:
+        """Find the Codex state SQLite database (state_*.sqlite)."""
+        try:
+            candidates = sorted(codex_dir.glob("state*.sqlite"), reverse=True)
+            return candidates[0] if candidates else None
+        except OSError:
+            return None
+
+    def _read_threads_from_dir(
+        self, codex_dir: Path, wsl_distro: str = "",
+    ) -> list[ProviderSession]:
+        """Read Codex threads from a state_*.sqlite database."""
+        if not codex_dir.exists():
+            return []
+
+        db_path = self._find_state_db(codex_dir)
+        if not db_path:
+            logger.debug("Codex: no state*.sqlite in %s", codex_dir)
             return self._list_sessions_from_files()
+
+        sessions = []
+        logger.debug("Codex: reading %s", db_path)
+        try:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT id, cwd, title, created_at, updated_at, archived "
+                "FROM threads WHERE archived=0 ORDER BY updated_at DESC LIMIT 20"
+            )
+            now_ts = int(time.time())
+            for row in cursor:
+                r = dict(row)
+                sid = r.get("id", "")
+                if not sid:
+                    continue
+
+                cwd = r.get("cwd", "")
+                title = r.get("title", "")
+                created_ts = r.get("created_at", 0)
+                updated_ts = r.get("updated_at", 0)
+
+                # Timestamps are Unix epoch seconds
+                started_at = datetime.fromtimestamp(
+                    created_ts, tz=timezone.utc
+                ) if created_ts else datetime.now(tz=timezone.utc)
+
+                # Consider "alive" if updated in the last 10 minutes
+                alive = (now_ts - updated_ts) < 600 if updated_ts else False
+
+                sessions.append(ProviderSession(
+                    session_id=sid,
+                    pid=0,
+                    cwd=cwd,
+                    started_at=started_at,
+                    is_alive=alive,
+                    slug=title or sid[:8],
+                    provider="codex",
+                    wsl_distro=wsl_distro,
+                ))
+            conn.close()
+            logger.debug("Codex: found %d threads in %s", len(sessions), db_path)
+        except Exception as e:
+            logger.warning("Failed to read Codex state DB %s: %s", db_path, e)
 
         return sessions
 
@@ -364,81 +446,11 @@ class CodexProvider(CLIProvider):
 
             logger.debug("Codex WSL [%s]: found %s", distro, codex_dir)
 
-            # Try SQLite index
-            found_db = False
-            for db_name in ("sessions.db", "index.db"):
-                db_path = codex_dir / db_name
-                try:
-                    if not db_path.exists():
-                        continue
-                except OSError:
-                    continue
-                found_db = True
-                try:
-                    conn = sqlite3.connect(str(db_path))
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.execute(
-                        "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 20"
-                    )
-                    for row in cursor:
-                        row_dict = dict(row)
-                        sid = row_dict.get("session_id", row_dict.get("id", ""))
-                        cwd = row_dict.get("cwd", row_dict.get("working_directory", ""))
-                        pid = row_dict.get("pid", 0)
-                        name = row_dict.get("name", row_dict.get("title", ""))
-                        created = row_dict.get("created_at", "")
-
-                        if not sid:
-                            continue
-
-                        started_at = datetime.now(tz=timezone.utc)
-                        if created:
-                            try:
-                                started_at = datetime.fromisoformat(str(created))
-                            except (ValueError, TypeError):
-                                pass
-
-                        alive = True  # Can't easily check WSL PIDs
-
-                        sessions.append(ProviderSession(
-                            session_id=sid,
-                            pid=pid,
-                            cwd=cwd,
-                            started_at=started_at,
-                            is_alive=alive,
-                            slug=name or sid[:8],
-                            provider="codex",
-                            wsl_distro=distro,
-                        ))
-                    conn.close()
-                except Exception as e:
-                    logger.warning("Failed to read WSL Codex DB %s: %s", db_path, e)
-                break  # Found a DB, don't try other names
-
-            if not found_db:
-                # Fallback: scan session files in WSL
-                wsl_sessions_dir = codex_dir / "sessions"
-                try:
-                    if not wsl_sessions_dir.exists():
-                        continue
-                except OSError:
-                    continue
-                for zst_file in wsl_sessions_dir.rglob("*.jsonl.zst"):
-                    fname = zst_file.stem.replace(".jsonl", "")
-                    parts = fname.split("-")
-                    sid = "-".join(parts[-5:]) if len(parts) >= 5 else fname
-                    sessions.append(ProviderSession(
-                        session_id=sid,
-                        pid=0,
-                        cwd="",
-                        started_at=datetime.fromtimestamp(
-                            zst_file.stat().st_mtime, tz=timezone.utc
-                        ),
-                        is_alive=False,
-                        slug=sid[:8],
-                        provider="codex",
-                        wsl_distro=distro,
-                    ))
+            # Try new format (state_*.sqlite → threads), then legacy, then files
+            found = self._read_threads_from_dir(codex_dir, wsl_distro=distro)
+            if not found:
+                found = self._read_legacy_db(codex_dir, wsl_distro=distro)
+            sessions.extend(found)
 
         return sessions
 
