@@ -13,6 +13,9 @@ Thumbs.db
 git-readme/
 smoke_test.env
 Screenshot*
+diagnose_codex.sh
+codex_report.txt
+Вывод.txt
 ARCHITECTURE.md
 CLAUDE.md
 IMPLEMENTATION.md
