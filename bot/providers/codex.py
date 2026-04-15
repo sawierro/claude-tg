@@ -19,6 +19,12 @@ _ENV = os.environ.copy()
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSIONS_DIR = CODEX_DIR / "sessions"
 
+# Additional paths where Codex CLI may store data
+_CODEX_ALT_DIRS = [
+    Path.home() / ".codex",
+    Path.home() / ".local" / "share" / "codex",
+]
+
 
 def _is_process_alive(pid: int) -> bool:
     """Check if a process with given PID is running."""
@@ -332,11 +338,22 @@ class CodexProvider(CLIProvider):
             if not home:
                 continue
 
-            codex_dir = _wsl_path_to_windows(distro, f"{home}/.codex")
-            try:
-                if not codex_dir.exists():
+            # Check multiple possible Codex data locations
+            codex_dirs = [
+                _wsl_path_to_windows(distro, f"{home}/.codex"),
+                _wsl_path_to_windows(distro, f"{home}/.local/share/codex"),
+            ]
+
+            codex_dir = None
+            for candidate in codex_dirs:
+                try:
+                    if candidate.exists():
+                        codex_dir = candidate
+                        break
+                except OSError:
                     continue
-            except OSError:
+
+            if not codex_dir:
                 continue
 
             # Try SQLite index
@@ -471,16 +488,17 @@ class CodexProvider(CLIProvider):
             home = _get_wsl_home(distro)
             if not home:
                 continue
-            wsl_sessions = _wsl_path_to_windows(distro, f"{home}/.codex/sessions")
-            try:
-                if not wsl_sessions.exists():
+            for sub in (".codex/sessions", ".local/share/codex/sessions"):
+                wsl_sessions = _wsl_path_to_windows(distro, f"{home}/{sub}")
+                try:
+                    if not wsl_sessions.exists():
+                        continue
+                except OSError:
                     continue
-            except OSError:
-                continue
-            for zst_file in wsl_sessions.rglob(f"*{session_id}*.jsonl.zst"):
-                return str(zst_file)
-            for jsonl_file in wsl_sessions.rglob(f"*{session_id}*.jsonl"):
-                return str(jsonl_file)
+                for zst_file in wsl_sessions.rglob(f"*{session_id}*.jsonl.zst"):
+                    return str(zst_file)
+                for jsonl_file in wsl_sessions.rglob(f"*{session_id}*.jsonl"):
+                    return str(jsonl_file)
 
         return None
 
