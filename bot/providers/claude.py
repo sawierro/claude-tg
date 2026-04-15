@@ -36,6 +36,8 @@ def _get_wsl_distros() -> list[str]:
             ["wsl", "-l", "-q"],
             capture_output=True, timeout=10,
         )
+        if result.returncode != 0:
+            return []
         # wsl.exe outputs UTF-16LE on Windows
         try:
             text = result.stdout.decode("utf-16-le")

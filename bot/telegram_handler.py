@@ -342,10 +342,10 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         label = s.slug or s.session_id[:8]
         short_cwd = Path(s.cwd).name if s.cwd else "?"
         btn_text = f"{icon}{wsl_tag} {label} | {short_cwd}"
-        # Encode provider (and wsl distro if present) in callback data
-        cb_data = f"attach:{s.provider}:{s.session_id}"
-        if s.wsl_distro:
-            cb_data = f"attach:{s.provider}:wsl={s.wsl_distro}:{s.session_id}"
+        # Telegram limits callback_data to 64 bytes.
+        # Use short session_id prefix — find_session() matches by prefix.
+        sid_short = s.session_id[:12]
+        cb_data = f"a:{s.provider}:{sid_short}"
         keyboard.append(
             [InlineKeyboardButton(btn_text, callback_data=cb_data)]
         )
@@ -418,7 +418,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     data = query.data
-    if data.startswith("attach:"):
+    if data.startswith("a:") or data.startswith("attach:"):
         await _handle_attach_callback(query, context)
     elif data.startswith("resume:"):
         await _handle_resume_callback(update, query, context)
@@ -449,23 +449,14 @@ async def _handle_sync_callback(query, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle attach button press — connect to a terminal session."""
     # Formats:
-    #   attach:provider:session_id
-    #   attach:provider:wsl=Distro:session_id
+    #   a:provider:sid_prefix        (new short format)
+    #   attach:provider:session_id   (legacy)
     raw = query.data
-    wsl_distro = ""
-
-    if ":wsl=" in raw:
-        # Parse WSL format: attach:provider:wsl=Distro:session_id
-        parts = raw.split(":", 3)
-        provider_name = parts[1]
-        wsl_distro = parts[2].removeprefix("wsl=")
-        session_id = parts[3]
+    parts = raw.split(":", 2)
+    if len(parts) == 3:
+        provider_name, session_id = parts[1], parts[2]
     else:
-        parts = raw.split(":", 2)
-        if len(parts) == 3:
-            provider_name, session_id = parts[1], parts[2]
-        else:
-            provider_name, session_id = "claude", parts[1]
+        provider_name, session_id = "claude", parts[-1]
 
     session_mgr: SessionManager = context.bot_data["session_mgr"]
 
@@ -487,7 +478,7 @@ async def _handle_attach_callback(query, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     name = ext.slug or ext.session_id[:8]
-    wsl_distro = ext.wsl_distro or wsl_distro
+    wsl_distro = ext.wsl_distro
 
     try:
         await session_mgr.import_external_session(
