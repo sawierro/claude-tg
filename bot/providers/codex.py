@@ -10,6 +10,7 @@ from pathlib import Path
 
 from bot.config import Config
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession
+from bot.providers.claude import _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class CodexProvider(CLIProvider):
         wsl_distro: str | None = None,
     ) -> ProviderResponse:
         """Run Codex CLI and return parsed response."""
+        if wsl_distro:
+            return await self._run_wsl(prompt, work_dir, session_id, wsl_distro)
+
         cmd = self._build_command(prompt, session_id)
         logger.info("Running: %s (cwd=%s)", cmd, work_dir)
         start_time = time.monotonic()
@@ -127,6 +131,87 @@ class CodexProvider(CLIProvider):
                 error=str(e),
             )
 
+    async def _run_wsl(
+        self,
+        prompt: str,
+        work_dir: str,
+        session_id: str | None,
+        wsl_distro: str,
+    ) -> ProviderResponse:
+        """Run Codex CLI inside a WSL distribution."""
+        parts = ["codex", "exec"]
+        if session_id:
+            parts.extend(["resume", session_id])
+        escaped_prompt = prompt.replace("'", "'\\''")
+        parts.append(f"'{escaped_prompt}'")
+        parts.extend(["--yolo", "--json"])
+        inner_cmd = " ".join(parts)
+
+        args = [
+            "wsl", "-d", wsl_distro,
+            "--cd", work_dir,
+            "--", "bash", "-l", "-c", inner_cmd,
+        ]
+        logger.info("Running WSL [%s]: %s (cwd=%s)", wsl_distro, inner_cmd, work_dir)
+        start_time = time.monotonic()
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            timeout_seconds = self.config.subprocess_timeout_minutes * 60
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Codex (WSL) timed out after %ds", timeout_seconds)
+                await _kill_process(process)
+                return ProviderResponse(
+                    session_id=session_id or "",
+                    text="",
+                    cost=None,
+                    duration_seconds=time.monotonic() - start_time,
+                    error=f"Timeout after {self.config.subprocess_timeout_minutes} minutes",
+                )
+
+            duration = time.monotonic() - start_time
+            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
+            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
+
+            if process.returncode != 0 and not raw_stdout:
+                return ProviderResponse(
+                    session_id=session_id or "",
+                    text=raw_stderr or raw_stdout,
+                    cost=None,
+                    duration_seconds=duration,
+                    error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
+                )
+
+            return self._parse_response(raw_stdout, session_id, duration)
+
+        except FileNotFoundError:
+            return ProviderResponse(
+                session_id=session_id or "",
+                text="",
+                cost=None,
+                duration_seconds=time.monotonic() - start_time,
+                error="wsl.exe not found — is WSL installed?",
+            )
+        except Exception as e:
+            logger.exception("Unexpected error running Codex in WSL")
+            return ProviderResponse(
+                session_id=session_id or "",
+                text="",
+                cost=None,
+                duration_seconds=time.monotonic() - start_time,
+                error=str(e),
+            )
+
     def _parse_response(
         self, raw: str, fallback_sid: str | None, duration: float
     ) -> ProviderResponse:
@@ -180,7 +265,13 @@ class CodexProvider(CLIProvider):
         )
 
     def list_sessions(self) -> list[ProviderSession]:
-        """List active Codex sessions from ~/.codex/ SQLite index."""
+        """List active Codex sessions (native + WSL)."""
+        sessions = self._list_native_sessions()
+        sessions.extend(self._list_wsl_sessions())
+        return sessions
+
+    def _list_native_sessions(self) -> list[ProviderSession]:
+        """List Codex sessions from native ~/.codex/."""
         sessions = []
 
         # Try SQLite index first
@@ -233,6 +324,99 @@ class CodexProvider(CLIProvider):
 
         return sessions
 
+    def _list_wsl_sessions(self) -> list[ProviderSession]:
+        """Scan WSL distributions for Codex sessions."""
+        sessions = []
+        for distro in _get_wsl_distros():
+            home = _get_wsl_home(distro)
+            if not home:
+                continue
+
+            codex_dir = _wsl_path_to_windows(distro, f"{home}/.codex")
+            try:
+                if not codex_dir.exists():
+                    continue
+            except OSError:
+                continue
+
+            # Try SQLite index
+            found_db = False
+            for db_name in ("sessions.db", "index.db"):
+                db_path = codex_dir / db_name
+                try:
+                    if not db_path.exists():
+                        continue
+                except OSError:
+                    continue
+                found_db = True
+                try:
+                    conn = sqlite3.connect(str(db_path))
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(
+                        "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 20"
+                    )
+                    for row in cursor:
+                        row_dict = dict(row)
+                        sid = row_dict.get("session_id", row_dict.get("id", ""))
+                        cwd = row_dict.get("cwd", row_dict.get("working_directory", ""))
+                        pid = row_dict.get("pid", 0)
+                        name = row_dict.get("name", row_dict.get("title", ""))
+                        created = row_dict.get("created_at", "")
+
+                        if not sid:
+                            continue
+
+                        started_at = datetime.now(tz=timezone.utc)
+                        if created:
+                            try:
+                                started_at = datetime.fromisoformat(str(created))
+                            except (ValueError, TypeError):
+                                pass
+
+                        alive = True  # Can't easily check WSL PIDs
+
+                        sessions.append(ProviderSession(
+                            session_id=sid,
+                            pid=pid,
+                            cwd=cwd,
+                            started_at=started_at,
+                            is_alive=alive,
+                            slug=name or sid[:8],
+                            provider="codex",
+                            wsl_distro=distro,
+                        ))
+                    conn.close()
+                except Exception as e:
+                    logger.warning("Failed to read WSL Codex DB %s: %s", db_path, e)
+                break  # Found a DB, don't try other names
+
+            if not found_db:
+                # Fallback: scan session files in WSL
+                wsl_sessions_dir = codex_dir / "sessions"
+                try:
+                    if not wsl_sessions_dir.exists():
+                        continue
+                except OSError:
+                    continue
+                for zst_file in wsl_sessions_dir.rglob("*.jsonl.zst"):
+                    fname = zst_file.stem.replace(".jsonl", "")
+                    parts = fname.split("-")
+                    sid = "-".join(parts[-5:]) if len(parts) >= 5 else fname
+                    sessions.append(ProviderSession(
+                        session_id=sid,
+                        pid=0,
+                        cwd="",
+                        started_at=datetime.fromtimestamp(
+                            zst_file.stat().st_mtime, tz=timezone.utc
+                        ),
+                        is_alive=False,
+                        slug=sid[:8],
+                        provider="codex",
+                        wsl_distro=distro,
+                    ))
+
+        return sessions
+
     def _list_sessions_from_files(self) -> list[ProviderSession]:
         """Fallback: scan session files if SQLite index not available."""
         if not SESSIONS_DIR.exists():
@@ -274,14 +458,30 @@ class CodexProvider(CLIProvider):
         return None
 
     def get_session_jsonl_path(self, session_id: str) -> str | None:
-        """Find session history file. Codex uses .jsonl.zst (compressed)."""
-        if not SESSIONS_DIR.exists():
-            return None
-        for zst_file in SESSIONS_DIR.rglob(f"*{session_id}*.jsonl.zst"):
-            return str(zst_file)
-        # Also check for uncompressed
-        for jsonl_file in SESSIONS_DIR.rglob(f"*{session_id}*.jsonl"):
-            return str(jsonl_file)
+        """Find session history file (native + WSL). Codex uses .jsonl.zst."""
+        # Native paths
+        if SESSIONS_DIR.exists():
+            for zst_file in SESSIONS_DIR.rglob(f"*{session_id}*.jsonl.zst"):
+                return str(zst_file)
+            for jsonl_file in SESSIONS_DIR.rglob(f"*{session_id}*.jsonl"):
+                return str(jsonl_file)
+
+        # WSL paths
+        for distro in _get_wsl_distros():
+            home = _get_wsl_home(distro)
+            if not home:
+                continue
+            wsl_sessions = _wsl_path_to_windows(distro, f"{home}/.codex/sessions")
+            try:
+                if not wsl_sessions.exists():
+                    continue
+            except OSError:
+                continue
+            for zst_file in wsl_sessions.rglob(f"*{session_id}*.jsonl.zst"):
+                return str(zst_file)
+            for jsonl_file in wsl_sessions.rglob(f"*{session_id}*.jsonl"):
+                return str(jsonl_file)
+
         return None
 
     def extract_end_turn_text(self, line: str) -> str | None:
