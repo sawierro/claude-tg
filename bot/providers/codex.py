@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import platform
+import shutil
 import sqlite3
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +45,30 @@ def _is_process_alive(pid: int) -> bool:
             return True
         except (OSError, ProcessLookupError):
             return False
+
+
+def _sqlite_connect(db_path: Path) -> sqlite3.Connection:
+    """Open SQLite DB, copying to temp file for UNC paths (\\\\wsl...)."""
+    path_str = str(db_path)
+    if path_str.startswith("\\\\"):
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(tmp_fd)
+        shutil.copy2(path_str, tmp_path)
+        conn = sqlite3.connect(tmp_path)
+        conn._tmp_path = tmp_path  # type: ignore[attr-defined]
+        return conn
+    return sqlite3.connect(path_str)
+
+
+def _sqlite_close(conn: sqlite3.Connection) -> None:
+    """Close SQLite connection and clean up temp file if any."""
+    conn.close()
+    tmp = getattr(conn, "_tmp_path", None)
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 class CodexProvider(CLIProvider):
@@ -305,7 +331,7 @@ class CodexProvider(CLIProvider):
 
         sessions = []
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = _sqlite_connect(db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 20"
@@ -340,7 +366,7 @@ class CodexProvider(CLIProvider):
                     provider="codex",
                     wsl_distro=wsl_distro,
                 ))
-            conn.close()
+            _sqlite_close(conn)
         except Exception as e:
             logger.warning("Failed to read legacy Codex DB %s: %s", db_path, e)
 
@@ -370,7 +396,7 @@ class CodexProvider(CLIProvider):
         sessions = []
         logger.debug("Codex: reading %s", db_path)
         try:
-            conn = sqlite3.connect(str(db_path))
+            conn = _sqlite_connect(db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 "SELECT id, cwd, title, created_at, updated_at, archived "
@@ -406,7 +432,7 @@ class CodexProvider(CLIProvider):
                     provider="codex",
                     wsl_distro=wsl_distro,
                 ))
-            conn.close()
+            _sqlite_close(conn)
             logger.debug("Codex: found %d threads in %s", len(sessions), db_path)
         except Exception as e:
             logger.warning("Failed to read Codex state DB %s: %s", db_path, e)
