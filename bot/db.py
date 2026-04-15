@@ -34,6 +34,20 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+CREATE TABLE IF NOT EXISTS bot_users (
+    chat_id     INTEGER PRIMARY KEY,
+    username    TEXT DEFAULT '',
+    full_name   TEXT DEFAULT '',
+    role        TEXT NOT NULL CHECK(role IN ('pending','viewer','denied')),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS session_viewers (
+    chat_id     INTEGER NOT NULL,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    PRIMARY KEY (chat_id, session_id)
+);
 """
 
 
@@ -202,3 +216,109 @@ async def cleanup_stale_sessions(
     )
     await conn.commit()
     return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# bot_users — access requests & viewer management
+# ---------------------------------------------------------------------------
+
+async def get_bot_user(conn: aiosqlite.Connection, chat_id: int) -> dict | None:
+    """Get a bot user by chat_id."""
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute("SELECT * FROM bot_users WHERE chat_id=?", (chat_id,)) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def create_bot_user(
+    conn: aiosqlite.Connection,
+    chat_id: int,
+    username: str,
+    full_name: str,
+    role: str = "pending",
+) -> None:
+    """Create a new bot user (access request)."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO bot_users (chat_id, username, full_name, role) VALUES (?, ?, ?, ?)",
+        (chat_id, username, full_name, role),
+    )
+    await conn.commit()
+
+
+async def update_bot_user_role(
+    conn: aiosqlite.Connection, chat_id: int, role: str
+) -> bool:
+    """Update user role. Returns True if user existed."""
+    cursor = await conn.execute(
+        "UPDATE bot_users SET role=? WHERE chat_id=?", (role, chat_id)
+    )
+    await conn.commit()
+    return cursor.rowcount > 0
+
+
+async def get_pending_users(conn: aiosqlite.Connection) -> list[dict]:
+    """Get all users with pending access requests."""
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        "SELECT * FROM bot_users WHERE role='pending' ORDER BY created_at ASC"
+    ) as cur:
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_viewers(conn: aiosqlite.Connection) -> list[dict]:
+    """Get all approved viewers."""
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        "SELECT * FROM bot_users WHERE role='viewer' ORDER BY created_at ASC"
+    ) as cur:
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# session_viewers — per-session read-only access
+# ---------------------------------------------------------------------------
+
+async def add_session_viewer(
+    conn: aiosqlite.Connection, chat_id: int, session_id: str
+) -> None:
+    """Grant read-only watcher access to a session."""
+    await conn.execute(
+        "INSERT OR IGNORE INTO session_viewers (chat_id, session_id) VALUES (?, ?)",
+        (chat_id, session_id),
+    )
+    await conn.commit()
+
+
+async def remove_session_viewer(
+    conn: aiosqlite.Connection, chat_id: int, session_id: str
+) -> None:
+    """Revoke watcher access to a session."""
+    await conn.execute(
+        "DELETE FROM session_viewers WHERE chat_id=? AND session_id=?",
+        (chat_id, session_id),
+    )
+    await conn.commit()
+
+
+async def get_session_viewer_ids(
+    conn: aiosqlite.Connection, session_id: str
+) -> list[int]:
+    """Get chat_ids of all viewers for a session."""
+    async with conn.execute(
+        "SELECT chat_id FROM session_viewers WHERE session_id=?", (session_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+
+async def get_viewer_session_ids(
+    conn: aiosqlite.Connection, chat_id: int
+) -> list[str]:
+    """Get session_ids a viewer has access to."""
+    async with conn.execute(
+        "SELECT session_id FROM session_viewers WHERE chat_id=?", (chat_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]

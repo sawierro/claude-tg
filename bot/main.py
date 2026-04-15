@@ -57,19 +57,14 @@ def main() -> None:
 
         session_mgr = SessionManager(config, conn)
 
-        # Register providers based on env var or config
-        providers_env = os.environ.get("PROVIDERS", "claude").lower()
-        provider_names = [p.strip() for p in providers_env.split(",")]
+        # Register all available providers
+        session_mgr.register_provider(ClaudeProvider(config))
 
-        if "claude" in provider_names:
-            session_mgr.register_provider(ClaudeProvider(config))
-
-        if "codex" in provider_names:
-            try:
-                from bot.providers.codex import CodexProvider
-                session_mgr.register_provider(CodexProvider(config))
-            except ImportError:
-                logger.warning("Codex provider not available (missing dependencies?)")
+        try:
+            from bot.providers.codex import CodexProvider
+            session_mgr.register_provider(CodexProvider(config))
+        except ImportError:
+            logger.debug("Codex provider not available")
 
         app = (
             Application.builder()

@@ -57,8 +57,67 @@ async def _safe_send(bot, chat_id: int, text: str, **kwargs):
         raise
 
 
+def _is_owner(chat_id: int, config: Config) -> bool:
+    """Check if chat_id is the bot owner."""
+    return chat_id in config.allowed_chat_ids
+
+
+async def _handle_access_request(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, config: Config
+) -> None:
+    """Handle message from an unknown user — create access request."""
+    from bot import db as db_module
+
+    chat_id = update.effective_chat.id
+    conn = context.bot_data.get("db_conn")
+    if not conn:
+        return
+
+    user = await db_module.get_bot_user(conn, chat_id)
+
+    if user:
+        if user["role"] == "viewer":
+            await update.message.reply_text(
+                "Вы подключены как наблюдатель \\(только чтение\\)\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        elif user["role"] == "pending":
+            await update.message.reply_text(
+                "Ваш запрос на доступ на рассмотрении\\. Ожидайте\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        # denied — silently ignore
+        return
+
+    # New user — create request and notify owner
+    tg_user = update.effective_user
+    username = tg_user.username or ""
+    full_name = tg_user.full_name or ""
+
+    await db_module.create_bot_user(conn, chat_id, username, full_name, "pending")
+    logger.info("Access request from %s (@%s, chat_id=%d)", full_name, username, chat_id)
+
+    await update.message.reply_text(
+        "Запрос на доступ отправлен владельцу\\. Ожидайте подтверждения\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    # Notify owner(s)
+    esc_name = escape_markdown_v2(full_name)
+    esc_user = escape_markdown_v2(f"@{username}") if username else "без username"
+    for owner_id in config.allowed_chat_ids:
+        await _safe_send(
+            context.bot, owner_id,
+            f"\U0001f514 *Запрос на доступ*\n\n"
+            f"\U0001f464 {esc_name} \\({esc_user}\\)\n"
+            f"ID: `{chat_id}`\n\n"
+            f"`/approve {chat_id}` \\- одобрить\n"
+            f"`/deny {chat_id}` \\- отклонить",
+        )
+
+
 def authorized(func):
-    """Decorator: only allow whitelisted chat IDs."""
+    """Decorator: only allow owner chat IDs. Others get access request flow."""
 
     @functools.wraps(func)
     async def wrapper(
@@ -79,11 +138,11 @@ def authorized(func):
             )
             return
 
-        if chat_id not in config.allowed_chat_ids:
-            logger.warning("Unauthorized access attempt from chat_id %d", chat_id)
-            return
+        if _is_owner(chat_id, config):
+            return await func(update, context, *args, **kwargs)
 
-        return await func(update, context, *args, **kwargs)
+        # Non-owner — handle access request
+        await _handle_access_request(update, context, config)
 
     return wrapper
 
@@ -110,16 +169,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/get <file>` \\- Скачать файл из проекта\n"
         "`/stop <name>` \\- Отключить сессию\n"
         "`/sync` \\- Записать сводку в файл для терминала\n"
-        "`/cancel` \\- Прервать текущую работу\n"
-        "`/help` \\- Эта справка\n\n"
+        "`/cancel` \\- Прервать текущую работу\n\n"
         "*Файлы:*\n"
         "\\- `/get README\\.md` \\- скачать файл\n"
         "\\- Отправьте файл \\- сохранится в work\\_dir\n\n"
-        "*Основной сценарий:*\n"
-        "1\\. Запустите `claude` в терминале\n"
-        "2\\. `/connect` \\- выберите сессию\n"
-        "3\\. Ответы Claude дублируются в телегу\n"
-        "4\\. Отправьте сообщение для управления"
+        "*Доступ:*\n"
+        "`/viewers` \\- запросы и наблюдатели\n"
+        "`/approve <id>` \\- одобрить запрос\n"
+        "`/deny <id>` \\- отклонить запрос\n"
+        "`/share <session> <id>` \\- дать доступ к сессии\n"
+        "`/unshare <session> <id>` \\- отозвать доступ"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -720,15 +779,203 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+# ---------------------------------------------------------------------------
+# Owner-only admin commands: /approve, /deny, /share, /unshare, /viewers
+# ---------------------------------------------------------------------------
+
+@authorized
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /approve <chat_id> — approve access request."""
+    from bot import db as db_module
+    conn = context.bot_data["db_conn"]
+
+    if not context.args:
+        await _safe_reply(update.message, "Использование: `/approve <chat_id>`")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await _safe_reply(update.message, format_error("Неверный chat\\_id"))
+        return
+
+    user = await db_module.get_bot_user(conn, target_id)
+    if not user:
+        await _safe_reply(update.message, format_error("Пользователь не найден"))
+        return
+
+    await db_module.update_bot_user_role(conn, target_id, "viewer")
+    esc = escape_markdown_v2(user["full_name"] or str(target_id))
+    await _safe_reply(update.message, f"\u2705 {esc} одобрен как наблюдатель")
+
+    # Notify the user
+    try:
+        await _safe_send(
+            context.bot, target_id,
+            "\u2705 Ваш запрос одобрен\\! Вы подключены как наблюдатель\\.",
+        )
+    except Exception:
+        pass
+
+
+@authorized
+async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /deny <chat_id> — deny access request."""
+    from bot import db as db_module
+    conn = context.bot_data["db_conn"]
+
+    if not context.args:
+        await _safe_reply(update.message, "Использование: `/deny <chat_id>`")
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await _safe_reply(update.message, format_error("Неверный chat\\_id"))
+        return
+
+    await db_module.update_bot_user_role(conn, target_id, "denied")
+    await _safe_reply(update.message, f"\u274c Доступ для `{target_id}` отклонён")
+
+
+@authorized
+async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /share <session_name> <chat_id> — grant watcher access."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = context.bot_data["db_conn"]
+
+    if len(context.args) < 2:
+        await _safe_reply(
+            update.message,
+            "Использование: `/share <session_name> <chat_id>`",
+        )
+        return
+
+    session_name = context.args[0]
+    try:
+        target_id = int(context.args[1])
+    except ValueError:
+        await _safe_reply(update.message, format_error("Неверный chat\\_id"))
+        return
+
+    # Check user is an approved viewer
+    user = await db_module.get_bot_user(conn, target_id)
+    if not user or user["role"] != "viewer":
+        await _safe_reply(update.message, format_error("Пользователь не одобрен как наблюдатель"))
+        return
+
+    # Find session
+    session = await db_module.get_session_by_name(conn, session_name)
+    if not session:
+        await _safe_reply(update.message, format_error(f"Сессия '{session_name}' не найдена"))
+        return
+
+    await db_module.add_session_viewer(conn, target_id, session["id"])
+    esc_name = escape_markdown_v2(session_name)
+    esc_user = escape_markdown_v2(user["full_name"] or str(target_id))
+    await _safe_reply(
+        update.message,
+        f"\U0001f441 {esc_user} подключён к сессии `{esc_name}`",
+    )
+
+    # Notify viewer
+    try:
+        await _safe_send(
+            context.bot, target_id,
+            f"\U0001f441 Вам открыт доступ к сессии `{esc_name}` \\(только чтение\\)",
+        )
+    except Exception:
+        pass
+
+
+@authorized
+async def cmd_unshare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /unshare <session_name> <chat_id> — revoke watcher access."""
+    from bot import db as db_module
+    conn = context.bot_data["db_conn"]
+
+    if len(context.args) < 2:
+        await _safe_reply(
+            update.message,
+            "Использование: `/unshare <session_name> <chat_id>`",
+        )
+        return
+
+    session_name = context.args[0]
+    try:
+        target_id = int(context.args[1])
+    except ValueError:
+        await _safe_reply(update.message, format_error("Неверный chat\\_id"))
+        return
+
+    session = await db_module.get_session_by_name(conn, session_name)
+    if not session:
+        await _safe_reply(update.message, format_error(f"Сессия '{session_name}' не найдена"))
+        return
+
+    await db_module.remove_session_viewer(conn, target_id, session["id"])
+    esc_name = escape_markdown_v2(session_name)
+    await _safe_reply(update.message, f"\u274c Доступ к `{esc_name}` для `{target_id}` отозван")
+
+
+@authorized
+async def cmd_viewers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /viewers — list pending requests and active viewers."""
+    from bot import db as db_module
+    conn = context.bot_data["db_conn"]
+
+    pending = await db_module.get_pending_users(conn)
+    viewers = await db_module.get_viewers(conn)
+
+    lines = []
+
+    if pending:
+        lines.append("*Ожидают одобрения:*\n")
+        for u in pending:
+            name = escape_markdown_v2(u["full_name"] or "?")
+            uname = escape_markdown_v2(f"@{u['username']}") if u["username"] else ""
+            lines.append(f"\U0001f7e1 {name} {uname} \\- `{u['chat_id']}`")
+        lines.append("")
+
+    if viewers:
+        lines.append("*Наблюдатели:*\n")
+        for u in viewers:
+            name = escape_markdown_v2(u["full_name"] or "?")
+            uname = escape_markdown_v2(f"@{u['username']}") if u["username"] else ""
+            sids = await db_module.get_viewer_session_ids(conn, u["chat_id"])
+            sess_count = f" \\({len(sids)} сессий\\)" if sids else ""
+            lines.append(f"\U0001f7e2 {name} {uname} \\- `{u['chat_id']}`{sess_count}")
+
+    if not lines:
+        await _safe_reply(update.message, "Нет запросов и наблюдателей\\.")
+        return
+
+    await _safe_reply(update.message, "\n".join(lines))
+
+
+@authorized
+async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle unsupported message types (stickers, GIFs, voice, etc.)."""
+    await _safe_reply(
+        update.message,
+        "Поддерживаются только текст и файлы\\. "
+        "Отправьте /help для списка команд\\.",
+    )
+
+
 def setup_handlers(app: Application, session_mgr: SessionManager, config: Config) -> None:
     """Register all handlers with the Telegram application."""
     app.bot_data["config"] = config
     app.bot_data["session_mgr"] = session_mgr
 
-    # Set up watcher callback — forwards terminal responses to Telegram
+    # Set up watcher callback — forwards terminal responses to owner + viewers
     async def on_terminal_response(session_id: str, session_name: str, text: str):
-        chat_ids = config.allowed_chat_ids
-        if not chat_ids:
+        from bot import db as db_module
+
+        conn = app.bot_data.get("db_conn")
+        owner_ids = config.allowed_chat_ids
+        if not owner_ids:
             return
 
         esc_name = escape_markdown_v2(session_name)
@@ -739,9 +986,20 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
         )
         chunks = split_message(notification, config.max_message_length)
 
-        for chat_id in chat_ids:
+        # Send to owners
+        for chat_id in owner_ids:
             for chunk in chunks:
                 await _safe_send(app.bot, chat_id, chunk)
+
+        # Send to session viewers
+        if conn:
+            viewer_ids = await db_module.get_session_viewer_ids(conn, session_id)
+            for chat_id in viewer_ids:
+                for chunk in chunks:
+                    try:
+                        await _safe_send(app.bot, chat_id, chunk)
+                    except Exception:
+                        logger.warning("Failed to send to viewer %d", chat_id)
 
     session_mgr.set_watcher_callback(on_terminal_response)
 
@@ -752,10 +1010,17 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CommandHandler("get", cmd_get))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("deny", cmd_deny))
+    app.add_handler(CommandHandler("share", cmd_share))
+    app.add_handler(CommandHandler("unshare", cmd_unshare))
+    app.add_handler(CommandHandler("viewers", cmd_viewers))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Catch-all for unsupported types (stickers, GIFs, voice, video, etc.)
+    app.add_handler(MessageHandler(~filters.COMMAND, handle_unsupported))
 
     logger.info("Telegram handlers registered")
