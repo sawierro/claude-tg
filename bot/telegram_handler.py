@@ -271,11 +271,45 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /sessions command."""
+    """Handle /sessions — show bot sessions + terminal sessions."""
     session_mgr: SessionManager = context.bot_data["session_mgr"]
-    sessions = await session_mgr.list_sessions()
-    text = format_session_list(sessions)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    # Bot-managed sessions (from DB)
+    db_sessions = await session_mgr.list_sessions()
+
+    # Terminal sessions (from providers)
+    terminal_sessions = []
+    db_ids = {s["id"] for s in db_sessions}
+    for provider in session_mgr._providers.values():
+        for s in provider.list_sessions():
+            if s.session_id not in db_ids:
+                terminal_sessions.append(s)
+
+    lines = []
+
+    if db_sessions:
+        lines.append("*Подключённые сессии:*\n")
+        for i, s in enumerate(db_sessions, 1):
+            emoji = {"running": "\u23f3", "waiting": "\U0001f535", "done": "\U0001f7e2", "error": "\U0001f534"}.get(s["status"], "\u2753")
+            name = escape_markdown_v2(s["name"])
+            provider = escape_markdown_v2(s.get("provider", "claude"))
+            wsl = " \U0001f427" if s.get("wsl_distro") else ""
+            lines.append(f"{i}\\. {emoji}{wsl} `{name}` \\({provider}\\)")
+
+    if terminal_sessions:
+        if lines:
+            lines.append("")
+        lines.append("*В терминалах \\(не подключены\\):*\n")
+        for s in terminal_sessions:
+            icon = {"claude": "\U0001f7e3", "codex": "\U0001f7e2"}.get(s.provider, "\u26aa")
+            wsl = f" \U0001f427{escape_markdown_v2(s.wsl_distro)}" if s.wsl_distro else ""
+            label = escape_markdown_v2(s.slug or s.session_id[:8])
+            lines.append(f"\u26ab{icon}{wsl} `{label}` \\- `/connect`")
+
+    if not lines:
+        lines.append("Нет сессий\\. Запустите `claude`/`codex` и `/connect`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
 @authorized
@@ -955,6 +989,32 @@ async def cmd_viewers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @authorized
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /debug — show provider diagnostics."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    lines = ["*Диагностика провайдеров:*\n"]
+
+    for name, provider in session_mgr._providers.items():
+        lines.append(f"*{escape_markdown_v2(name)}:*")
+        try:
+            sessions = provider.list_sessions()
+            lines.append(f"  Найдено сессий: {len(sessions)}")
+            for s in sessions[:5]:
+                wsl = f" WSL/{escape_markdown_v2(s.wsl_distro)}" if s.wsl_distro else ""
+                alive = "\u2705" if s.is_alive else "\u274c"
+                label = escape_markdown_v2(s.slug or s.session_id[:12])
+                lines.append(f"  {alive}{wsl} `{label}`")
+            if len(sessions) > 5:
+                lines.append(f"  \\.\\.\\.и ещё {len(sessions) - 5}")
+        except Exception as e:
+            lines.append(f"  \U0001f534 Ошибка: {escape_markdown_v2(str(e))}")
+        lines.append("")
+
+    await _safe_reply(update.message, "\n".join(lines))
+
+
+@authorized
 async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle unsupported message types (stickers, GIFs, voice, etc.)."""
     await _safe_reply(
@@ -1015,6 +1075,7 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("share", cmd_share))
     app.add_handler(CommandHandler("unshare", cmd_unshare))
     app.add_handler(CommandHandler("viewers", cmd_viewers))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))

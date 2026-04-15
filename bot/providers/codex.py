@@ -279,6 +279,7 @@ class CodexProvider(CLIProvider):
     def _list_native_sessions(self) -> list[ProviderSession]:
         """List Codex sessions from native ~/.codex/."""
         sessions = []
+        logger.debug("Codex: scanning native %s (exists=%s)", CODEX_DIR, CODEX_DIR.exists())
 
         # Try SQLite index first
         db_path = CODEX_DIR / "sessions.db"
@@ -333,9 +334,12 @@ class CodexProvider(CLIProvider):
     def _list_wsl_sessions(self) -> list[ProviderSession]:
         """Scan WSL distributions for Codex sessions."""
         sessions = []
-        for distro in _get_wsl_distros():
+        distros = _get_wsl_distros()
+        logger.debug("Codex WSL: distros=%s", distros)
+        for distro in distros:
             home = _get_wsl_home(distro)
             if not home:
+                logger.debug("Codex WSL: no home for %s", distro)
                 continue
 
             # Check multiple possible Codex data locations
@@ -354,7 +358,11 @@ class CodexProvider(CLIProvider):
                     continue
 
             if not codex_dir:
+                logger.debug("Codex WSL [%s]: no codex dir found at %s", distro,
+                             [str(d) for d in codex_dirs])
                 continue
+
+            logger.debug("Codex WSL [%s]: found %s", distro, codex_dir)
 
             # Try SQLite index
             found_db = False
