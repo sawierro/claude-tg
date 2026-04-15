@@ -375,11 +375,82 @@ class CodexProvider(CLIProvider):
     @staticmethod
     def _find_state_db(codex_dir: Path) -> Path | None:
         """Find the Codex state SQLite database (state_*.sqlite)."""
+        # Try glob first
         try:
             candidates = sorted(codex_dir.glob("state*.sqlite"), reverse=True)
-            return candidates[0] if candidates else None
+            if candidates:
+                return candidates[0]
         except OSError:
-            return None
+            pass
+
+        # Fallback: manual listing (glob may fail on UNC paths)
+        try:
+            for f in codex_dir.iterdir():
+                name = f.name
+                if name.startswith("state") and name.endswith(".sqlite") and "-" not in name:
+                    return f
+        except OSError:
+            pass
+
+        return None
+
+    def diagnose(self) -> list[str]:
+        """Return diagnostic lines for /debug."""
+        lines = []
+
+        # Native
+        lines.append(f"Native dir: {CODEX_DIR} (exists={CODEX_DIR.exists()})")
+        db = self._find_state_db(CODEX_DIR)
+        lines.append(f"Native state DB: {db}")
+        if CODEX_DIR.exists():
+            try:
+                files = [f.name for f in CODEX_DIR.iterdir() if f.name.startswith("state") or f.name.endswith(".db")]
+                lines.append(f"DB files: {files}")
+            except OSError as e:
+                lines.append(f"iterdir error: {e}")
+
+        # WSL
+        from bot.providers.claude import _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows
+        distros = _get_wsl_distros()
+        lines.append(f"WSL distros: {distros}")
+        for distro in distros:
+            home = _get_wsl_home(distro)
+            lines.append(f"  [{distro}] home={home}")
+            if not home:
+                continue
+            for sub in (".codex", ".local/share/codex"):
+                d = _wsl_path_to_windows(distro, f"{home}/{sub}")
+                exists = False
+                try:
+                    exists = d.exists()
+                except OSError:
+                    pass
+                if not exists:
+                    continue
+                lines.append(f"  [{distro}] dir={d}")
+                try:
+                    all_files = [f.name for f in d.iterdir()]
+                    lines.append(f"  [{distro}] files={all_files[:20]}")
+                except OSError as e:
+                    lines.append(f"  [{distro}] iterdir error: {e}")
+                db = self._find_state_db(d)
+                lines.append(f"  [{distro}] state DB={db}")
+                if db:
+                    try:
+                        conn = _sqlite_connect(db)
+                        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                        lines.append(f"  [{distro}] tables={[t[0] for t in tables]}")
+                        try:
+                            count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+                            active = conn.execute("SELECT COUNT(*) FROM threads WHERE archived=0").fetchone()[0]
+                            lines.append(f"  [{distro}] threads: {count} total, {active} active")
+                        except Exception as e:
+                            lines.append(f"  [{distro}] threads query: {e}")
+                        _sqlite_close(conn)
+                    except Exception as e:
+                        lines.append(f"  [{distro}] DB open error: {e}")
+
+        return lines
 
     def _read_threads_from_dir(
         self, codex_dir: Path, wsl_distro: str = "",
@@ -391,7 +462,7 @@ class CodexProvider(CLIProvider):
         db_path = self._find_state_db(codex_dir)
         if not db_path:
             logger.debug("Codex: no state*.sqlite in %s", codex_dir)
-            return self._list_sessions_from_files()
+            return []
 
         sessions = []
         logger.debug("Codex: reading %s", db_path)

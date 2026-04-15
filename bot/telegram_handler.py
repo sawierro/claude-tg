@@ -1009,6 +1009,16 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 lines.append(f"  \\.\\.\\.и ещё {len(sessions) - 5}")
         except Exception as e:
             lines.append(f"  \U0001f534 Ошибка: {escape_markdown_v2(str(e))}")
+
+        # Detailed diagnostics if provider supports it
+        if hasattr(provider, "diagnose"):
+            lines.append("")
+            lines.append(f"  *Детали:*")
+            try:
+                for diag_line in provider.diagnose():
+                    lines.append(f"  `{escape_markdown_v2(diag_line)}`")
+            except Exception as e:
+                lines.append(f"  diagnose error: {escape_markdown_v2(str(e))}")
         lines.append("")
 
     await _safe_reply(update.message, "\n".join(lines))
