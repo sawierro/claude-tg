@@ -107,10 +107,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/connect` \\- Подключиться к терминалу\n"
         "`/new <name> [path] [prompt]` \\- Новая сессия\n"
         "`/sessions` \\- Активные сессии бота\n"
+        "`/get <file>` \\- Скачать файл из проекта\n"
         "`/stop <name>` \\- Отключить сессию\n"
         "`/sync` \\- Записать сводку в файл для терминала\n"
         "`/cancel` \\- Прервать текущую работу\n"
         "`/help` \\- Эта справка\n\n"
+        "*Файлы:*\n"
+        "\\- `/get README\\.md` \\- скачать файл\n"
+        "\\- Отправьте файл \\- сохранится в work\\_dir\n\n"
         "*Основной сценарий:*\n"
         "1\\. Запустите `claude` в терминале\n"
         "2\\. `/connect` \\- выберите сессию\n"
@@ -598,6 +602,124 @@ async def _resume_and_reply(
         await session_mgr.update_tg_message(session["id"], last_msg.message_id)
 
 
+async def _find_active_session(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_mgr: SessionManager
+) -> dict | None:
+    """Find the active session for file operations. Returns session dict or None."""
+    # Check remembered session
+    remembered_id = context.user_data.get("active_session_id")
+    if remembered_id:
+        from bot import db as db_module
+        session = await db_module.get_session(session_mgr.conn, remembered_id)
+        if session and session["status"] in ("running", "waiting"):
+            return session
+
+    active = await session_mgr.list_sessions()
+    waiting = [s for s in active if s["status"] in ("running", "waiting")]
+
+    if len(waiting) == 1:
+        return waiting[0]
+    elif len(waiting) > 1:
+        names = ", ".join(s["name"] for s in waiting)
+        await _safe_reply(
+            update.message,
+            f"Несколько активных сессий: `{escape_markdown_v2(names)}`\n"
+            f"Используйте `/connect` чтобы выбрать\\.",
+        )
+        return None
+    else:
+        await _safe_reply(
+            update.message,
+            "Нет активных сессий\\. `/connect` или `/new`",
+        )
+        return None
+
+
+def _resolve_work_path(session: dict, rel_path: str) -> Path:
+    """Resolve a relative path against session's work_dir, handling WSL."""
+    work_dir = session["work_dir"]
+    wsl_distro = session.get("wsl_distro", "")
+
+    if wsl_distro:
+        from bot.providers.claude import _wsl_path_to_windows
+        base = _wsl_path_to_windows(wsl_distro, work_dir)
+    else:
+        base = Path(work_dir)
+
+    return base / rel_path
+
+
+@authorized
+async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /get <path> — send a file from session's work_dir to Telegram."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: `/get <filename>`\n"
+            "Пример: `/get README\\.md`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    rel_path = " ".join(context.args)
+    session = await _find_active_session(update, context, session_mgr)
+    if not session:
+        return
+
+    file_path = _resolve_work_path(session, rel_path)
+
+    if not file_path.exists():
+        await _safe_reply(update.message, format_error(f"Файл не найден: {rel_path}"))
+        return
+
+    if not file_path.is_file():
+        await _safe_reply(update.message, format_error(f"Не файл: {rel_path}"))
+        return
+
+    try:
+        with open(file_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=file_path.name,
+            )
+    except Exception as e:
+        logger.exception("Failed to send file")
+        await _safe_reply(update.message, format_error(f"Ошибка отправки: {e}"))
+
+
+@authorized
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle file uploads — save to active session's work_dir."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    session = await _find_active_session(update, context, session_mgr)
+    if not session:
+        return
+
+    filename = doc.file_name or "uploaded_file"
+    target_path = _resolve_work_path(session, filename)
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(str(target_path))
+    except Exception as e:
+        logger.exception("Failed to download file")
+        await _safe_reply(update.message, format_error(f"Ошибка загрузки: {e}"))
+        return
+
+    esc_name = escape_markdown_v2(filename)
+    esc_dir = escape_markdown_v2(session["work_dir"])
+    await _safe_reply(
+        update.message,
+        f"\u2705 `{esc_name}` \u2192 `{esc_dir}`",
+    )
+
+
 def setup_handlers(app: Application, session_mgr: SessionManager, config: Config) -> None:
     """Register all handlers with the Telegram application."""
     app.bot_data["config"] = config
@@ -629,9 +751,11 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("connect", cmd_connect))
     app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("get", cmd_get))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Telegram handlers registered")
