@@ -13,6 +13,11 @@ Connect to a running Claude Code terminal session via Telegram, see responses in
 - **Session management** — create, list, stop sessions from Telegram
 - **Smart message routing** — replies go to the right session, inline keyboards for disambiguation
 - **Auto-registration** — first `/start` auto-registers your `chat_id`
+- **Prompt templates** — upload `.md`/`.txt` snippets and dispatch them with one tap
+- **Session health check** — `/ping` detects hung runs and reports idle time
+- **Token usage tracking** — local counter per session and across all sessions (5h/24h/all-time)
+- **Auto-resume after rate limits** — queue messages when usage limit hits; bot retries automatically or notifies when the window resets
+- **Self-update from GitHub** — `/update` fetches and applies new commits
 
 ## How It Works
 
@@ -108,7 +113,39 @@ Telegram commands create a separate conversation branch (Claude CLI limitation).
 | `/sessions` | List active bot sessions |
 | `/stop <name>` | Disconnect a session |
 | `/cancel` | Kill running Claude process |
+| `/ping [name]` | Check whether a session is active or hung |
+| `/usage [name]` | Token usage for 5h / 24h / all-time |
+| `/pending` | List queued prompts waiting for rate-limit reset |
+| `/prompts` | List saved prompt templates (inline keyboard to send) |
+| `/prompt <name>` | Send a prompt template to the active session |
+| `/prompt_del <name>` | Delete a prompt template |
+| `/update` | Check GitHub for bot updates and pull |
+| `/get <file>` | Download a file from the session's work dir |
+| `/approve <id>` · `/deny <id>` | Handle access requests |
+| `/share <session> <id>` · `/unshare ...` | Grant/revoke per-session viewer access |
+| `/viewers` | List pending access requests and approved viewers |
+| `/debug` | Provider diagnostics (paths, sessions, WSL distros) |
 | `/help` | Show help |
+
+### Prompt Templates
+
+Save frequently-used prompts as files and dispatch them without retyping.
+
+1. Send a `.md` or `.txt` file to the bot with caption `#prompt` — it's saved to `prompts/`
+2. Use `/prompts` to see the list as inline buttons — tap one to send it to the active session
+3. Or call `/prompt <name>` directly
+
+Filenames allow letters, numbers, spaces, `_`, `-`, `.` and must be ≤50 bytes. Max file size: 1 MB.
+
+### Auto-Resume After Rate Limit
+
+When Claude returns a usage/rate limit error, the bot parses the reset time (or falls back to +5h) and offers three buttons:
+
+- **Auto-resume** — resend the prompt automatically once the window resets
+- **Notify** (default) — ping you when the window resets, with a button to resume manually
+- **Cancel** — drop the queued prompt
+
+A background worker checks the queue every 60 seconds. Use `/pending` to see queued items.
 
 ### Message Routing
 
@@ -131,11 +168,12 @@ TELEGRAM_TOKEN=123456:ABC-...
     "claude_path": "claude",
     "max_message_length": 4000,
     "session_timeout_hours": 24,
-    "subprocess_timeout_minutes": 30
+    "subprocess_timeout_minutes": 30,
+    "prompts_dir": "prompts"
 }
 ```
 
-`allowed_chat_ids` is populated automatically on first `/start`.
+`allowed_chat_ids` is populated automatically on first `/start`. `prompts_dir` is where prompt templates are stored (relative to the project root by default).
 
 ## Requirements
 
@@ -149,11 +187,15 @@ TELEGRAM_TOKEN=123456:ABC-...
 bot/
 ├── main.py              # Entry point, polling loop, graceful shutdown
 ├── config.py            # Config loading (.env + config.json)
-├── db.py                # SQLite (aiosqlite), sessions & messages tables
+├── db.py                # SQLite (aiosqlite): sessions, messages, viewers, pending_prompts
 ├── telegram_handler.py  # All Telegram commands and message routing
 ├── session_manager.py   # Session lifecycle, watcher management
 ├── session_watcher.py   # JSONL file watcher for terminal responses
 ├── message_formatter.py # MarkdownV2 escaping, message splitting
+├── prompts.py           # Prompt template storage (list/save/read/delete)
+├── updater.py           # Self-update via git fetch/pull
+├── limit_detector.py    # Rate/usage limit detection + reset-time parsing
+├── resume_worker.py     # Background worker for queued prompts
 └── providers/
     ├── base.py          # Abstract CLI provider interface
     ├── claude.py        # Claude Code CLI integration
@@ -163,7 +205,9 @@ bot/
 ## Limitations
 
 - Telegram commands and terminal are separate context branches — use `/sync` to bridge them
-- One user per bot instance (designed for personal use)
+- One user per bot instance (designed for personal use; viewers get read-only access)
 - Claude CLI must be installed and logged in on the same machine
 - Long responses are split at 4000 characters (Telegram limit)
 - Terminal session does not see Telegram messages in real-time (CLI limitation)
+- `/usage` is a local counter — the real remaining quota on Anthropic's side is not exposed via the CLI in `-p` mode
+- Rate-limit reset time is parsed from the error message when possible, otherwise defaults to +5h (Claude's rolling window)
