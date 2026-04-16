@@ -20,6 +20,7 @@ class SessionManager:
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._watchers: dict[str, SessionWatcher] = {}
         self._watcher_callback = None
+        self._limit_callback = None
         self._providers: dict[str, CLIProvider] = {}
 
     def register_provider(self, provider: CLIProvider) -> None:
@@ -37,6 +38,10 @@ class SessionManager:
     def set_watcher_callback(self, callback) -> None:
         """Set callback for watcher notifications: async fn(session_id, name, text)."""
         self._watcher_callback = callback
+
+    def set_limit_callback(self, callback) -> None:
+        """Set callback invoked when watcher detects a limit error: async fn(session_id, raw_line)."""
+        self._limit_callback = callback
 
     async def create_session(
         self, name: str, work_dir: str, prompt: str, provider_name: str = "claude"
@@ -214,7 +219,10 @@ class SessionManager:
         if not provider:
             logger.warning("Provider %s not registered, skipping watcher", provider_name)
             return
-        watcher = SessionWatcher(session_id, name, provider, self._watcher_callback)
+        watcher = SessionWatcher(
+            session_id, name, provider, self._watcher_callback,
+            on_limit_callback=self._limit_callback,
+        )
         self._watchers[session_id] = watcher
         watcher.start()
 

@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     provider        TEXT NOT NULL DEFAULT 'claude',
     wsl_distro      TEXT NOT NULL DEFAULT '',
     last_tg_msg_id  INTEGER,
+    auto_continue   INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -99,6 +100,14 @@ async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
         await conn.execute("ALTER TABLE messages ADD COLUMN tokens_out INTEGER")
         await conn.commit()
         logger.info("Migrated: added tokens_in/tokens_out columns to messages")
+
+    # Migration: add auto_continue column if missing
+    try:
+        await conn.execute("SELECT auto_continue FROM sessions LIMIT 1")
+    except Exception:
+        await conn.execute("ALTER TABLE sessions ADD COLUMN auto_continue INTEGER NOT NULL DEFAULT 0")
+        await conn.commit()
+        logger.info("Migrated: added auto_continue column to sessions")
 
     logger.info("Database initialized at %s", db_path)
     return conn
@@ -440,3 +449,28 @@ async def list_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
     ) as cur:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+async def get_pending_by_session(
+    conn: aiosqlite.Connection, session_id: str
+) -> dict | None:
+    """Return the most recent pending prompt for a session, or None."""
+    async with conn.execute(
+        "SELECT * FROM pending_prompts WHERE session_id=? "
+        "ORDER BY retry_at DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def set_auto_continue(
+    conn: aiosqlite.Connection, session_id: str, enabled: bool
+) -> bool:
+    """Toggle auto_continue for a session. Returns True if session existed."""
+    cursor = await conn.execute(
+        "UPDATE sessions SET auto_continue=? WHERE id=?",
+        (1 if enabled else 0, session_id),
+    )
+    await conn.commit()
+    return cursor.rowcount > 0

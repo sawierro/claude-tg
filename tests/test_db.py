@@ -131,3 +131,40 @@ async def test_get_last_message_time(conn):
     await insert_message(conn, "sid-lm", "user", "hi")
     ts = await get_last_message_time(conn, "sid-lm")
     assert ts is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_continue_default_and_toggle(conn):
+    from bot.db import set_auto_continue
+    await create_session(conn, "sid-ac", "ac-test", "/tmp")
+
+    s = await get_session(conn, "sid-ac")
+    assert s["auto_continue"] == 0
+
+    ok = await set_auto_continue(conn, "sid-ac", True)
+    assert ok
+    s = await get_session(conn, "sid-ac")
+    assert s["auto_continue"] == 1
+
+    ok = await set_auto_continue(conn, "sid-ac", False)
+    assert ok
+    s = await get_session(conn, "sid-ac")
+    assert s["auto_continue"] == 0
+
+    # Non-existent session returns False
+    ok = await set_auto_continue(conn, "no-such-sid", True)
+    assert not ok
+
+
+@pytest.mark.asyncio
+async def test_get_pending_by_session(conn):
+    from bot.db import create_pending_prompt, get_pending_by_session
+    await create_session(conn, "sid-pb", "pending-by", "/tmp")
+
+    assert await get_pending_by_session(conn, "sid-pb") is None
+
+    pid = await create_pending_prompt(conn, "sid-pb", 42, "hi", "2026-04-16 12:00:00", "auto")
+    row = await get_pending_by_session(conn, "sid-pb")
+    assert row is not None
+    assert row["id"] == pid
+    assert row["mode"] == "auto"

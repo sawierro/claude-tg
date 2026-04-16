@@ -17,6 +17,7 @@ Connect to a running Claude Code terminal session via Telegram, see responses in
 - **Session health check** — `/ping` detects hung runs and reports idle time
 - **Token usage tracking** — local counter per session and across all sessions (5h/24h/all-time)
 - **Auto-resume after rate limits** — queue messages when usage limit hits; bot retries automatically or notifies when the window resets
+- **Auto-continue for terminal sessions** — opt-in per session; if Claude in the terminal hits a limit while you're watching from Telegram, the bot detects it in the JSONL stream and sends a continuation prompt as soon as the window resets (no prompt from you needed)
 - **Self-update from GitHub** — `/update` fetches and applies new commits
 
 ## How It Works
@@ -116,6 +117,7 @@ Telegram commands create a separate conversation branch (Claude CLI limitation).
 | `/ping [name]` | Check whether a session is active or hung |
 | `/usage [name]` | Token usage for 5h / 24h / all-time |
 | `/pending` | List queued prompts waiting for rate-limit reset |
+| `/autocontinue [on\|off] [name]` | Toggle auto-continue for a terminal session (🔁 icon in `/sessions`) |
 | `/prompts` | List saved prompt templates (inline keyboard to send) |
 | `/prompt <name>` | Send a prompt template to the active session |
 | `/prompt_del <name>` | Delete a prompt template |
@@ -148,6 +150,19 @@ If you'd rather not auto-send, use the buttons on the notification:
 
 A background worker checks the queue every 60 seconds. Use `/pending` to see queued items.
 
+### Auto-Continue for Terminal Sessions
+
+The rate-limit auto-resume above covers prompts you sent from Telegram. For sessions running in your terminal that you're merely observing via the watcher, enable **auto-continue** to have the bot push a "continue" prompt automatically when the limit resets — useful when you're away from the machine.
+
+```
+/autocontinue on       # enable for the active session
+/autocontinue off      # disable
+/autocontinue          # show current status
+/autocontinue on myproj   # target a specific session by name
+```
+
+Sessions with auto-continue enabled show a 🔁 icon in `/sessions`. When the watcher detects a limit error, the bot posts a Telegram notification with a **Cancel** button and queues the continuation; 5-minute debounce prevents duplicate queueing from repeated limit messages. The continuation prompt is configurable via `auto_continue_prompt` in `config.json` (default: *"Продолжи с того места, где остановился."*).
+
 ### Message Routing
 
 - **Reply** to a session message — routes to that session
@@ -170,7 +185,8 @@ TELEGRAM_TOKEN=123456:ABC-...
     "max_message_length": 4000,
     "session_timeout_hours": 24,
     "subprocess_timeout_minutes": 30,
-    "prompts_dir": "prompts"
+    "prompts_dir": "prompts",
+    "auto_continue_prompt": "Продолжи с того места, где остановился."
 }
 ```
 

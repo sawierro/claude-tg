@@ -3,12 +3,14 @@ import logging
 import time
 from pathlib import Path
 
+from bot import limit_detector
 from bot.providers.base import CLIProvider
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 3
 MIN_NOTIFY_INTERVAL_SECONDS = 2  # debounce: max 1 notification per 2 seconds
+LIMIT_DEBOUNCE_SECONDS = 300     # 5 min between limit-detected callbacks
 
 
 class SessionWatcher:
@@ -20,16 +22,19 @@ class SessionWatcher:
         session_name: str,
         provider: CLIProvider,
         callback,
+        on_limit_callback=None,
     ):
         self.session_id = session_id
         self.session_name = session_name
         self._provider = provider
         self._callback = callback
+        self._on_limit_callback = on_limit_callback
         self._task: asyncio.Task | None = None
         self._paused = asyncio.Event()
         self._paused.set()
         self._skip_to_end = False
         self._last_notify_time: float = 0
+        self._last_limit_time: float = float("-inf")
 
     def start(self) -> None:
         """Start watching in background."""
@@ -119,6 +124,21 @@ class SessionWatcher:
                             )
                         except Exception:
                             logger.exception("Watcher callback failed")
+
+                    # Limit detection (runs regardless of whether text was extracted)
+                    if self._on_limit_callback and limit_detector.is_limit_error(line):
+                        now = time.monotonic()
+                        if now - self._last_limit_time >= LIMIT_DEBOUNCE_SECONDS:
+                            self._last_limit_time = now
+                            logger.info(
+                                "Watcher detected limit in %s", self.session_name
+                            )
+                            try:
+                                await self._on_limit_callback(
+                                    self.session_id, line
+                                )
+                            except Exception:
+                                logger.exception("Limit callback failed")
 
         except asyncio.CancelledError:
             pass

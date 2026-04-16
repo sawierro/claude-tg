@@ -23,6 +23,7 @@ class Config:
     session_timeout_hours: int = 24
     subprocess_timeout_minutes: int = 30
     prompts_dir: str = "prompts"
+    auto_continue_prompt: str = "Продолжи с того места, где остановился."
 
     def save(self, path: str = DEFAULT_CONFIG_PATH) -> None:
         """Save current config to JSON file (token excluded — use .env)."""
@@ -35,6 +36,7 @@ class Config:
             "session_timeout_hours": self.session_timeout_hours,
             "subprocess_timeout_minutes": self.subprocess_timeout_minutes,
             "prompts_dir": self.prompts_dir,
+            "auto_continue_prompt": self.auto_continue_prompt,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
@@ -72,4 +74,8 @@ def load_config(path: str | None = None) -> Config:
         session_timeout_hours=data.get("session_timeout_hours", 24),
         subprocess_timeout_minutes=data.get("subprocess_timeout_minutes", 30),
         prompts_dir=data.get("prompts_dir", "prompts"),
+        auto_continue_prompt=data.get(
+            "auto_continue_prompt",
+            "Продолжи с того места, где остановился.",
+        ),
     )

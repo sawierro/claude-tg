@@ -185,6 +185,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/ping [name]` \\- Проверить статус сессии\n"
         "`/usage [name]` \\- Расход токенов за 5ч/24ч/всё время\n"
         "`/pending` \\- Очередь сообщений при сбросе лимита\n"
+        "`/autocontinue [on|off]` \\- Авто\\-продолжение терминальной сессии "
+        "после сброса лимита \\(индикатор 🔁\\)\n"
         "`/update` \\- Проверить обновления бота\n\n"
         "*Файлы:*\n"
         "\\- `/get README\\.md` \\- скачать файл\n"
@@ -315,7 +317,8 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             name = escape_markdown_v2(s["name"])
             provider = escape_markdown_v2(s.get("provider", "claude"))
             wsl = " \U0001f427" if s.get("wsl_distro") else ""
-            lines.append(f"{i}\\. {emoji}{wsl} `{name}` \\({provider}\\)")
+            ac = " \U0001f501" if s.get("auto_continue") else ""
+            lines.append(f"{i}\\. {emoji}{wsl}{ac} `{name}` \\({provider}\\)")
 
     if terminal_sessions:
         if lines:
@@ -434,6 +437,91 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ))
 
     await _safe_reply(update.message, "\n".join(lines))
+
+
+async def _resolve_session_for_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, name_arg: str | None
+):
+    """Find a session by explicit name/sid or fall back to the active one."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = session_mgr.conn
+
+    if name_arg:
+        session = await db_module.get_session_by_name(conn, name_arg)
+        if not session:
+            session = await db_module.get_session(conn, name_arg)
+        return session
+
+    remembered_id = context.user_data.get("active_session_id")
+    if remembered_id:
+        session = await db_module.get_session(conn, remembered_id)
+        if session:
+            return session
+
+    active = await session_mgr.list_sessions()
+    waiting = [s for s in active if s["status"] in ("running", "waiting")]
+    if len(waiting) == 1:
+        return waiting[0]
+    return None
+
+
+@authorized
+async def cmd_autocontinue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /autocontinue [on|off] [name] — toggle per-session auto-continue."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = session_mgr.conn
+
+    args = context.args or []
+    action: str | None = None
+    name_arg: str | None = None
+
+    if args:
+        if args[0].lower() in ("on", "off"):
+            action = args[0].lower()
+            name_arg = args[1] if len(args) > 1 else None
+        else:
+            name_arg = args[0]
+
+    session = await _resolve_session_for_command(update, context, name_arg)
+    if not session:
+        await _safe_reply(
+            update.message,
+            "Укажите сессию: `/autocontinue [on|off] <name>` "
+            "или выберите через `/connect`",
+        )
+        return
+
+    name_esc = escape_markdown_v2(session["name"])
+
+    if action is None:
+        state = "\U0001f501 включено" if session.get("auto_continue") else "\u2b55 выключено"
+        await _safe_reply(
+            update.message,
+            f"*Auto\\-continue* для `{name_esc}`: {escape_markdown_v2(state)}\n\n"
+            f"Управление: `/autocontinue on {escape_markdown_v2(session['name'])}` / "
+            f"`/autocontinue off {escape_markdown_v2(session['name'])}`",
+        )
+        return
+
+    enabled = action == "on"
+    ok = await db_module.set_auto_continue(conn, session["id"], enabled)
+    if not ok:
+        await _safe_reply(update.message, format_error("Не удалось обновить настройку"))
+        return
+
+    if enabled:
+        await _safe_reply(
+            update.message,
+            f"\U0001f501 Auto\\-continue *включено* для `{name_esc}`\\. "
+            f"При лимите бот автоматически продолжит сессию после сброса\\.",
+        )
+    else:
+        await _safe_reply(
+            update.message,
+            f"\u2b55 Auto\\-continue *выключено* для `{name_esc}`\\.",
+        )
 
 
 @authorized
@@ -1822,6 +1910,55 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
 
     session_mgr.set_watcher_callback(on_terminal_response)
 
+    async def on_terminal_limit(session_id: str, raw_text: str) -> None:
+        """Watcher detected a limit in a terminal session — queue auto-continuation if opted in."""
+        from bot import db as db_module
+
+        conn = app.bot_data.get("db_conn")
+        if not conn:
+            return
+        session = await db_module.get_session(conn, session_id)
+        if not session or not session.get("auto_continue"):
+            return
+        existing = await db_module.get_pending_by_session(conn, session_id)
+        if existing:
+            return
+
+        owner_ids = config.allowed_chat_ids
+        if not owner_ids:
+            return
+
+        retry_at = limit_detector.parse_reset_time(raw_text)
+        retry_at_iso = retry_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        pending_id = await db_module.create_pending_prompt(
+            conn, session_id, owner_ids[0],
+            config.auto_continue_prompt, retry_at_iso, "auto",
+        )
+
+        name_esc = escape_markdown_v2(session["name"])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "\u274c Отменить автопродолжение",
+                callback_data=f"resm_cancel:{pending_id}",
+            ),
+        ]])
+        text = (
+            f"\U0001f504 *Лимит в терминальной сессии* `{name_esc}`\n"
+            f"Автопродолжение после сброса в `{escape_markdown_v2(retry_at_iso)} UTC`"
+        )
+        for chat_id in owner_ids:
+            try:
+                await app.bot.send_message(
+                    chat_id, text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                logger.exception("Failed to send auto-continue notification")
+
+    session_mgr.set_limit_callback(on_terminal_limit)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
@@ -1840,6 +1977,7 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("autocontinue", cmd_autocontinue))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("prompts", cmd_prompts))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
