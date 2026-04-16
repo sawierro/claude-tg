@@ -185,8 +185,19 @@ class ClaudeProvider(CLIProvider):
     def __init__(self, config: Config):
         self.config = config
 
+    def _build_args(self, prompt: str, session_id: str | None = None) -> list[str]:
+        """Build argument list for Claude CLI (no shell interpretation)."""
+        args = [self.config.claude_path]
+        if session_id:
+            args.extend(["--resume", session_id])
+        args.extend(["-p", prompt])
+        args.extend(["--dangerously-skip-permissions"])
+        args.extend(self.config.claude_flags)
+        args.extend(["--output-format", "json"])
+        return args
+
     def _build_command(self, prompt: str, session_id: str | None = None) -> str:
-        """Build shell command for Claude CLI."""
+        """Build shell command string (for logging/tests only)."""
         parts = [self.config.claude_path]
         if session_id:
             parts.extend(["--resume", session_id])
@@ -207,13 +218,13 @@ class ClaudeProvider(CLIProvider):
         if wsl_distro:
             return await self._run_wsl(prompt, work_dir, session_id, wsl_distro)
 
-        cmd = self._build_command(prompt, session_id)
-        logger.info("Running: %s (cwd=%s)", cmd, work_dir)
+        args = self._build_args(prompt, session_id)
+        logger.info("Running: %s (cwd=%s)", args, work_dir)
         start_time = time.monotonic()
 
         try:
-            process = await asyncio.create_subprocess_shell(
-                cmd,
+            process = await asyncio.create_subprocess_exec(
+                *args,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

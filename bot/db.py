@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_tg_msg ON sessions(last_tg_msg_id);
 
 CREATE TABLE IF NOT EXISTS bot_users (
     chat_id     INTEGER PRIMARY KEY,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS session_viewers (
 async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
     """Initialize database, create tables, enable WAL mode."""
     conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA foreign_keys=ON")
     await conn.executescript(SCHEMA_SQL)
@@ -117,7 +119,6 @@ async def update_session_status(
 
 async def get_session(conn: aiosqlite.Connection, session_id: str) -> dict | None:
     """Get session by Claude session ID."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)) as cur:
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -125,7 +126,6 @@ async def get_session(conn: aiosqlite.Connection, session_id: str) -> dict | Non
 
 async def get_session_by_name(conn: aiosqlite.Connection, name: str) -> dict | None:
     """Get session by user-friendly name."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute("SELECT * FROM sessions WHERE name=?", (name,)) as cur:
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -135,7 +135,6 @@ async def get_session_by_tg_message(
     conn: aiosqlite.Connection, tg_message_id: int
 ) -> dict | None:
     """Get session by the last Telegram message ID (for reply routing)."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM sessions WHERE last_tg_msg_id=?", (tg_message_id,)
     ) as cur:
@@ -145,7 +144,6 @@ async def get_session_by_tg_message(
 
 async def get_active_sessions(conn: aiosqlite.Connection) -> list[dict]:
     """Get all sessions with status running or waiting."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM sessions WHERE status IN ('running', 'waiting') ORDER BY updated_at DESC"
     ) as cur:
@@ -155,7 +153,6 @@ async def get_active_sessions(conn: aiosqlite.Connection) -> list[dict]:
 
 async def get_all_sessions(conn: aiosqlite.Connection) -> list[dict]:
     """Get all sessions ordered by last update."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM sessions ORDER BY updated_at DESC"
     ) as cur:
@@ -186,7 +183,6 @@ async def insert_message(
 
 async def get_session_messages(conn: aiosqlite.Connection, session_id: str) -> list[dict]:
     """Return all messages for a session ordered by created_at."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC",
         (session_id,),
@@ -224,7 +220,6 @@ async def cleanup_stale_sessions(
 
 async def get_bot_user(conn: aiosqlite.Connection, chat_id: int) -> dict | None:
     """Get a bot user by chat_id."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute("SELECT * FROM bot_users WHERE chat_id=?", (chat_id,)) as cur:
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -258,7 +253,6 @@ async def update_bot_user_role(
 
 async def get_pending_users(conn: aiosqlite.Connection) -> list[dict]:
     """Get all users with pending access requests."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM bot_users WHERE role='pending' ORDER BY created_at ASC"
     ) as cur:
@@ -268,7 +262,6 @@ async def get_pending_users(conn: aiosqlite.Connection) -> list[dict]:
 
 async def get_viewers(conn: aiosqlite.Connection) -> list[dict]:
     """Get all approved viewers."""
-    conn.row_factory = aiosqlite.Row
     async with conn.execute(
         "SELECT * FROM bot_users WHERE role='viewer' ORDER BY created_at ASC"
     ) as cur:

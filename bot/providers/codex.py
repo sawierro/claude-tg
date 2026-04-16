@@ -58,16 +58,19 @@ def _sqlite_connect(db_path: Path) -> sqlite3.Connection:
     path_str = str(db_path)
     if path_str.startswith("\\\\"):
         tmp_dir = tempfile.mkdtemp(prefix="codex_db_")
-        dst = Path(tmp_dir) / db_path.name
-        shutil.copy2(path_str, str(dst))
-        # Copy WAL files if present — without them recent data is lost
-        for suffix in ("-shm", "-wal"):
-            wal_src = Path(path_str + suffix)
-            if wal_src.exists():
-                shutil.copy2(str(wal_src), str(dst) + suffix)
-        conn = sqlite3.connect(str(dst))
-        conn._tmp_dir = tmp_dir  # type: ignore[attr-defined]
-        return conn
+        try:
+            dst = Path(tmp_dir) / db_path.name
+            shutil.copy2(path_str, str(dst))
+            for suffix in ("-shm", "-wal"):
+                wal_src = Path(path_str + suffix)
+                if wal_src.exists():
+                    shutil.copy2(str(wal_src), str(dst) + suffix)
+            conn = sqlite3.connect(str(dst))
+            conn._tmp_dir = tmp_dir  # type: ignore[attr-defined]
+            return conn
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
     return sqlite3.connect(path_str)
 
 
@@ -91,8 +94,17 @@ class CodexProvider(CLIProvider):
         self.config = config
         self._codex_path = config.codex_path if hasattr(config, "codex_path") else "codex"
 
+    def _build_args(self, prompt: str, session_id: str | None = None) -> list[str]:
+        """Build argument list for Codex CLI (no shell interpretation)."""
+        args = [self._codex_path, "exec"]
+        if session_id:
+            args.extend(["resume", session_id])
+        args.append(prompt)
+        args.extend(["--yolo", "--json"])
+        return args
+
     def _build_command(self, prompt: str, session_id: str | None = None) -> str:
-        """Build shell command for Codex CLI."""
+        """Build shell command string (for logging/tests only)."""
         parts = [self._codex_path, "exec"]
         if session_id:
             parts.extend(["resume", session_id])
@@ -111,13 +123,13 @@ class CodexProvider(CLIProvider):
         if wsl_distro:
             return await self._run_wsl(prompt, work_dir, session_id, wsl_distro)
 
-        cmd = self._build_command(prompt, session_id)
-        logger.info("Running: %s (cwd=%s)", cmd, work_dir)
+        args = self._build_args(prompt, session_id)
+        logger.info("Running: %s (cwd=%s)", args, work_dir)
         start_time = time.monotonic()
 
         try:
-            process = await asyncio.create_subprocess_shell(
-                cmd,
+            process = await asyncio.create_subprocess_exec(
+                *args,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

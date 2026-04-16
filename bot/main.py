@@ -108,7 +108,7 @@ def main() -> None:
             await app.updater.stop()
             await app.stop()
 
-        await conn.close()
+        # conn closed by post_shutdown callback
         logger.info("Bot stopped.")
 
     try:

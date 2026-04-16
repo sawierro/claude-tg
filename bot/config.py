@@ -24,9 +24,8 @@ class Config:
     subprocess_timeout_minutes: int = 30
 
     def save(self, path: str = DEFAULT_CONFIG_PATH) -> None:
-        """Save current config to JSON file."""
+        """Save current config to JSON file (token excluded — use .env)."""
         data = {
-            "telegram_token": self.telegram_token,
             "allowed_chat_ids": self.allowed_chat_ids,
             "default_work_dir": self.default_work_dir,
             "claude_path": self.claude_path,

@@ -80,7 +80,7 @@ async def test_run_claude_success(config):
     ))
     mock_process.returncode = 0
 
-    with patch("asyncio.create_subprocess_shell", return_value=mock_process):
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
         resp = await run_claude("hello", ".", config)
         assert resp.session_id == "new-sid"
         assert resp.text == "ok"
@@ -93,6 +93,6 @@ async def test_run_claude_nonzero_exit(config):
     mock_process.communicate = AsyncMock(return_value=(b"", b"some error"))
     mock_process.returncode = 1
 
-    with patch("asyncio.create_subprocess_shell", return_value=mock_process):
+    with patch("asyncio.create_subprocess_exec", return_value=mock_process):
         resp = await run_claude("hello", ".", config)
         assert resp.error is not None

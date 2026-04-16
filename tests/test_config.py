@@ -73,5 +73,5 @@ def test_config_save(tmp_path):
 
     with open(path) as f:
         data = json.load(f)
-    assert data["telegram_token"] == "save-test"
+    assert "telegram_token" not in data  # token must not be saved to file
     assert data["allowed_chat_ids"] == [999]

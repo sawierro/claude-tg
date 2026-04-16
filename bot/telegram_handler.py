@@ -512,6 +512,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline keyboard callbacks."""
     query = update.callback_query
+    config: Config = context.bot_data["config"]
+
+    if not _is_owner(query.from_user.id, config):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+
     await query.answer()
 
     data = query.data
@@ -728,8 +734,14 @@ async def _find_active_session(
         return None
 
 
+_SENSITIVE_FILES = {"config.json", ".env", "claude_tg.db"}
+
+
 def _resolve_work_path(session: dict, rel_path: str) -> Path:
-    """Resolve a relative path against session's work_dir, handling WSL."""
+    """Resolve a relative path against session's work_dir, handling WSL.
+
+    Raises ValueError on path traversal or access to sensitive files.
+    """
     work_dir = session["work_dir"]
     wsl_distro = session.get("wsl_distro", "")
 
@@ -739,7 +751,18 @@ def _resolve_work_path(session: dict, rel_path: str) -> Path:
     else:
         base = Path(work_dir)
 
-    return base / rel_path
+    resolved = (base / rel_path).resolve()
+    base_resolved = base.resolve()
+
+    # Prevent path traversal
+    if not str(resolved).startswith(str(base_resolved)):
+        raise ValueError("Выход за пределы рабочей директории")
+
+    # Block sensitive files
+    if resolved.name in _SENSITIVE_FILES:
+        raise ValueError(f"Доступ к {resolved.name} запрещён")
+
+    return resolved
 
 
 @authorized
@@ -760,7 +783,11 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not session:
         return
 
-    file_path = _resolve_work_path(session, rel_path)
+    try:
+        file_path = _resolve_work_path(session, rel_path)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
 
     if not file_path.exists():
         await _safe_reply(update.message, format_error(f"Файл не найден: {rel_path}"))
@@ -795,7 +822,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     filename = doc.file_name or "uploaded_file"
-    target_path = _resolve_work_path(session, filename)
+    # Sanitize filename — strip path components
+    filename = Path(filename).name
+
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+    if doc.file_size and doc.file_size > MAX_UPLOAD_SIZE:
+        await _safe_reply(update.message, format_error("Файл слишком большой \\(макс 10 МБ\\)"))
+        return
+
+    try:
+        target_path = _resolve_work_path(session, filename)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)

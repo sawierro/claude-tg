@@ -281,7 +281,13 @@ class SessionManager:
 
         content = "\n".join(lines)
 
-        sync_path = Path(session["work_dir"]) / ".claude-tg-sync.md"
+        work_dir = session["work_dir"]
+        wsl_distro = session.get("wsl_distro", "")
+        if wsl_distro:
+            from bot.providers.claude import _wsl_path_to_windows
+            sync_path = _wsl_path_to_windows(wsl_distro, work_dir) / ".claude-tg-sync.md"
+        else:
+            sync_path = Path(work_dir) / ".claude-tg-sync.md"
         sync_path.write_text(content, encoding="utf-8")
         logger.info("Sync file written: %s", sync_path)
 
