@@ -12,7 +12,10 @@ from pathlib import Path
 
 from bot.config import Config
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession
-from bot.providers.claude import _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows
+from bot.providers.claude import (
+    _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows,
+    _find_wsl_exe, _resolve_wsl_cli,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +51,33 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def _sqlite_connect(db_path: Path) -> sqlite3.Connection:
-    """Open SQLite DB, copying to temp file for UNC paths (\\\\wsl...)."""
+    """Open SQLite DB, copying to temp dir for UNC paths (\\\\wsl...).
+
+    Copies .sqlite + WAL files (-shm, -wal) to preserve recent data.
+    """
     path_str = str(db_path)
     if path_str.startswith("\\\\"):
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".sqlite")
-        os.close(tmp_fd)
-        shutil.copy2(path_str, tmp_path)
-        conn = sqlite3.connect(tmp_path)
-        conn._tmp_path = tmp_path  # type: ignore[attr-defined]
+        tmp_dir = tempfile.mkdtemp(prefix="codex_db_")
+        dst = Path(tmp_dir) / db_path.name
+        shutil.copy2(path_str, str(dst))
+        # Copy WAL files if present — without them recent data is lost
+        for suffix in ("-shm", "-wal"):
+            wal_src = Path(path_str + suffix)
+            if wal_src.exists():
+                shutil.copy2(str(wal_src), str(dst) + suffix)
+        conn = sqlite3.connect(str(dst))
+        conn._tmp_dir = tmp_dir  # type: ignore[attr-defined]
         return conn
     return sqlite3.connect(path_str)
 
 
 def _sqlite_close(conn: sqlite3.Connection) -> None:
-    """Close SQLite connection and clean up temp file if any."""
+    """Close SQLite connection and clean up temp dir if any."""
     conn.close()
-    tmp = getattr(conn, "_tmp_path", None)
-    if tmp:
+    tmp_dir = getattr(conn, "_tmp_dir", None)
+    if tmp_dir:
         try:
-            os.unlink(tmp)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         except OSError:
             pass
 
@@ -171,7 +182,9 @@ class CodexProvider(CLIProvider):
         wsl_distro: str,
     ) -> ProviderResponse:
         """Run Codex CLI inside a WSL distribution."""
-        parts = ["codex", "exec"]
+        codex_bin = _resolve_wsl_cli(wsl_distro, "codex")
+
+        parts = [codex_bin, "exec"]
         if session_id:
             parts.extend(["resume", session_id])
         escaped_prompt = prompt.replace("'", "'\\''")
@@ -179,8 +192,9 @@ class CodexProvider(CLIProvider):
         parts.extend(["--yolo", "--json"])
         inner_cmd = " ".join(parts)
 
+        wsl = _find_wsl_exe()
         args = [
-            "wsl", "-d", wsl_distro,
+            wsl, "-d", wsl_distro,
             "--cd", work_dir,
             "--", "bash", "-l", "-c", inner_cmd,
         ]
@@ -264,9 +278,9 @@ class CodexProvider(CLIProvider):
 
             event_type = event.get("type", "")
 
-            # Extract session ID from thread.started
+            # Extract session ID — multiple possible fields
             if event_type == "thread.started":
-                session_id = event.get("sessionId", session_id)
+                session_id = event.get("sessionId", event.get("thread_id", session_id))
 
             # Extract final text from the last assistant message
             if event_type == "item.completed":
@@ -276,6 +290,12 @@ class CodexProvider(CLIProvider):
                     for c in content:
                         if c.get("type") == "text":
                             final_text = c.get("text", "")
+
+            # New format: agent_message
+            if event_type == "agent_message":
+                text = event.get("text", "")
+                if text:
+                    final_text = text
 
             # Capture errors
             if event_type == "error":

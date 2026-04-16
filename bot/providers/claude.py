@@ -27,13 +27,45 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 _wsl_unc_prefix_cache: dict[str, str] = {}
 
 
+def _find_wsl_exe() -> str:
+    """Find wsl.exe reliably — shutil.which, then System32 fallbacks."""
+    import shutil as _shutil
+    found = _shutil.which("wsl")
+    if found:
+        return found
+    # Fallback: common Windows paths (PATH may be incomplete)
+    for candidate in (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wsl.exe",
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Sysnative" / "wsl.exe",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return "wsl"  # hope for the best
+
+
+def _resolve_wsl_cli(distro: str, cli_name: str) -> str:
+    """Find a CLI tool inside WSL — handles nvm/npm-installed binaries."""
+    try:
+        result = _subprocess.run(
+            [_find_wsl_exe(), "-d", distro, "--", "bash", "-lc", f"command -v {cli_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        path = result.stdout.strip()
+        if result.returncode == 0 and path:
+            return path
+    except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
+        pass
+    return cli_name
+
+
 def _get_wsl_distros() -> list[str]:
     """Return installed WSL distribution names."""
     if platform.system() != "Windows":
         return []
+    wsl = _find_wsl_exe()
     try:
         result = _subprocess.run(
-            ["wsl", "-l", "-q"],
+            [wsl, "-l", "-q"],
             capture_output=True, timeout=10,
         )
         if result.returncode != 0:
@@ -58,7 +90,7 @@ def _get_wsl_home(distro: str) -> str | None:
     """Return the default user's home directory inside a WSL distro."""
     try:
         result = _subprocess.run(
-            ["wsl", "-d", distro, "--", "printenv", "HOME"],
+            [_find_wsl_exe(), "-d", distro, "--", "printenv", "HOME"],
             capture_output=True, text=True, timeout=10,
         )
         home = result.stdout.strip()
@@ -252,8 +284,11 @@ class ClaudeProvider(CLIProvider):
         wsl_distro: str,
     ) -> ProviderResponse:
         """Run Claude Code CLI inside a WSL distribution."""
+        # Resolve actual claude path inside WSL (handles nvm/npm installs)
+        claude_bin = _resolve_wsl_cli(wsl_distro, "claude")
+
         # Build inner command for Linux shell
-        parts = ["claude"]
+        parts = [claude_bin]
         if session_id:
             parts.extend(["--resume", session_id])
         # Escape single quotes for bash single-quoted string
@@ -265,8 +300,9 @@ class ClaudeProvider(CLIProvider):
         inner_cmd = " ".join(parts)
 
         # Use create_subprocess_exec to avoid Windows cmd.exe quoting issues
+        wsl = _find_wsl_exe()
         args = [
-            "wsl", "-d", wsl_distro,
+            wsl, "-d", wsl_distro,
             "--cd", work_dir,
             "--", "bash", "-l", "-c", inner_cmd,
         ]
