@@ -139,10 +139,11 @@ Filenames allow letters, numbers, spaces, `_`, `-`, `.` and must be ≤50 bytes.
 
 ### Auto-Resume After Rate Limit
 
-When Claude returns a usage/rate limit error, the bot parses the reset time (or falls back to +5h) and offers three buttons:
+When Claude returns a usage/rate limit error, the bot parses the reset time (or falls back to +5h) and **queues the prompt for automatic resume by default** — you don't need to do anything.
 
-- **Auto-resume** — resend the prompt automatically once the window resets
-- **Notify** (default) — ping you when the window resets, with a button to resume manually
+If you'd rather not auto-send, use the buttons on the notification:
+
+- **Notify only** — ping you when the window resets with a manual "Resume" button
 - **Cancel** — drop the queued prompt
 
 A background worker checks the queue every 60 seconds. Use `/pending` to see queued items.

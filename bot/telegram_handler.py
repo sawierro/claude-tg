@@ -1201,9 +1201,9 @@ async def _offer_pending_resume(
     retry_at = limit_detector.parse_reset_time(error)
     retry_at_iso = retry_at.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Default mode is "manual" — safest: just notify, let user decide then.
+    # Default mode is "auto" — fire-and-forget: resume automatically at reset.
     pending_id = await db_module.create_pending_prompt(
-        session_mgr.conn, session["id"], chat_id, prompt, retry_at_iso, "manual",
+        session_mgr.conn, session["id"], chat_id, prompt, retry_at_iso, "auto",
     )
 
     wait_seconds = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
@@ -1212,11 +1212,7 @@ async def _offer_pending_resume(
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            "\U0001f504 Auto-resume при сбросе",
-            callback_data=f"lim:auto:{pending_id}",
-        )],
-        [InlineKeyboardButton(
-            "\U0001f514 Просто напомнить (по умолчанию)",
+            "\U0001f514 Только напомнить",
             callback_data=f"lim:manual:{pending_id}",
         )],
         [InlineKeyboardButton(
@@ -1230,7 +1226,8 @@ async def _offer_pending_resume(
             f"\U0001f7e1 *Лимит достигнут для* `{name_esc}`\n"
             f"Сброс через: {escape_markdown_v2(wait_str)} "
             f"\\(`{escape_markdown_v2(retry_at_iso)} UTC`\\)\n\n"
-            f"Что делать с сообщением?"
+            f"\U0001f504 *Автовозобновление включено* \\- сообщение отправится само после сброса\\.\n"
+            f"Не нравится? Выберите вариант ниже\\."
         ),
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=keyboard,
