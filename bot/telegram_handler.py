@@ -1,6 +1,7 @@
 import json
 import logging
 import functools
+import os
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,7 +42,8 @@ async def _safe_reply(message, text: str, **kwargs):
             plain = text.replace("\\", "")
             return await message.reply_text(plain, **kwargs)
         if "message is too long" in err:
-            return await message.reply_text(text[:4000] + "\n\\.\\.\\.\\(обрезано\\)", parse_mode=ParseMode.MARKDOWN_V2, **kwargs)
+            plain = text.replace("\\", "")[:4000] + "\n...(обрезано)"
+            return await message.reply_text(plain, **kwargs)
         raise
 
 
@@ -58,7 +60,8 @@ async def _safe_send(bot, chat_id: int, text: str, **kwargs):
             plain = text.replace("\\", "")
             return await bot.send_message(chat_id, plain, **kwargs)
         if "message is too long" in err:
-            return await bot.send_message(chat_id, text[:4000] + "\n...(обрезано)", **kwargs)
+            plain = text.replace("\\", "")[:4000] + "\n...(обрезано)"
+            return await bot.send_message(chat_id, plain, **kwargs)
         raise
 
 
@@ -131,7 +134,7 @@ def authorized(func):
         config: Config = context.bot_data["config"]
         chat_id = update.effective_chat.id
 
-        # Registration mode: empty whitelist → auto-register first user
+        # Registration mode: auto-register first user only
         if not config.allowed_chat_ids:
             config.allowed_chat_ids.append(chat_id)
             config.save()
@@ -739,7 +742,12 @@ async def _find_active_session(
         return None
 
 
-_SENSITIVE_FILES = {"config.json", ".env", "claude_tg.db"}
+_SENSITIVE_FILES = {
+    "config.json", ".env", "claude_tg.db",
+    ".env.local", ".env.production", ".env.development",
+    "secrets.json", "credentials.json",
+    "id_rsa", "id_ed25519", ".pgpass",
+}
 
 
 def _resolve_work_path(session: dict, rel_path: str) -> Path:
@@ -759,8 +767,8 @@ def _resolve_work_path(session: dict, rel_path: str) -> Path:
     resolved = (base / rel_path).resolve()
     base_resolved = base.resolve()
 
-    # Prevent path traversal
-    if not str(resolved).startswith(str(base_resolved)):
+    # Prevent path traversal (os.sep suffix prevents /project_evil matching /project)
+    if resolved != base_resolved and not str(resolved).startswith(str(base_resolved) + os.sep):
         raise ValueError("Выход за пределы рабочей директории")
 
     # Block sensitive files

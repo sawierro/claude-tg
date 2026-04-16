@@ -108,7 +108,7 @@ class CodexProvider(CLIProvider):
             return await self._run_wsl(prompt, work_dir, session_id, wsl_distro)
 
         args = self._build_args(prompt, session_id)
-        logger.info("Running: %s (cwd=%s)", args, work_dir)
+        logger.info("Running codex (cwd=%s, resume=%s)", work_dir, bool(session_id))
         start_time = time.monotonic()
 
         try:
@@ -194,7 +194,7 @@ class CodexProvider(CLIProvider):
             "--cd", work_dir,
             "--", "bash", "-l", "-c", inner_cmd,
         ]
-        logger.info("Running WSL [%s]: %s (cwd=%s)", wsl_distro, inner_cmd, work_dir)
+        logger.info("Running codex WSL [%s] (cwd=%s, resume=%s)", wsl_distro, work_dir, bool(session_id))
         start_time = time.monotonic()
 
         try:
