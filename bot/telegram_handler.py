@@ -35,11 +35,13 @@ async def _safe_reply(message, text: str, **kwargs):
             text, parse_mode=ParseMode.MARKDOWN_V2, **kwargs
         )
     except Exception as e:
-        if "can't parse entities" in str(e).lower():
+        err = str(e).lower()
+        if "can't parse entities" in err:
             logger.warning("MarkdownV2 parse failed, falling back to plain text")
-            # Strip markdown escapes for readability
             plain = text.replace("\\", "")
             return await message.reply_text(plain, **kwargs)
+        if "message is too long" in err:
+            return await message.reply_text(text[:4000] + "\n\\.\\.\\.\\(обрезано\\)", parse_mode=ParseMode.MARKDOWN_V2, **kwargs)
         raise
 
 
@@ -50,10 +52,13 @@ async def _safe_send(bot, chat_id: int, text: str, **kwargs):
             chat_id, text, parse_mode=ParseMode.MARKDOWN_V2, **kwargs
         )
     except Exception as e:
-        if "can't parse entities" in str(e).lower():
+        err = str(e).lower()
+        if "can't parse entities" in err:
             logger.warning("MarkdownV2 parse failed, falling back to plain text")
             plain = text.replace("\\", "")
             return await bot.send_message(chat_id, plain, **kwargs)
+        if "message is too long" in err:
+            return await bot.send_message(chat_id, text[:4000] + "\n...(обрезано)", **kwargs)
         raise
 
 
@@ -671,11 +676,11 @@ async def _resume_and_reply(
         )
         return
 
-    logger.info(
-        "Claude response: session=%s text=%s error=%s",
+    logger.debug(
+        "Response: session=%s len=%d error=%s",
         response.session_id[:8] if response.session_id else "?",
-        response.text[:100] if response.text else "(empty)",
-        response.error,
+        len(response.text) if response.text else 0,
+        bool(response.error),
     )
 
     # Delete processing message

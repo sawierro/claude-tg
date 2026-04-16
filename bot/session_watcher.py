@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 from bot.providers.base import CLIProvider
@@ -7,6 +8,7 @@ from bot.providers.base import CLIProvider
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 3
+MIN_NOTIFY_INTERVAL_SECONDS = 2  # debounce: max 1 notification per 2 seconds
 
 
 class SessionWatcher:
@@ -27,6 +29,7 @@ class SessionWatcher:
         self._paused = asyncio.Event()
         self._paused.set()
         self._skip_to_end = False
+        self._last_notify_time: float = 0
 
     def start(self) -> None:
         """Start watching in background."""
@@ -100,6 +103,12 @@ class SessionWatcher:
 
                     text = self._provider.extract_end_turn_text(line)
                     if text:
+                        # Debounce: skip if notified too recently
+                        now = time.monotonic()
+                        if now - self._last_notify_time < MIN_NOTIFY_INTERVAL_SECONDS:
+                            continue
+                        self._last_notify_time = now
+
                         logger.info(
                             "Watcher detected response in %s: %s",
                             self.session_name, text[:80]

@@ -1,3 +1,6 @@
+import asyncio
+import os
+import platform
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +27,38 @@ class ProviderSession:
     slug: str
     provider: str  # "claude" or "codex"
     wsl_distro: str = ""  # WSL distribution name, empty for native Windows/Linux
+
+
+def is_process_alive(pid: int) -> bool:
+    """Check if a process with given PID is running (cross-platform)."""
+    if platform.system() == "Windows":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+async def kill_process(process: asyncio.subprocess.Process) -> None:
+    """Gracefully terminate, then force kill after 5 seconds."""
+    try:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+    except ProcessLookupError:
+        pass
 
 
 class CLIProvider(ABC):

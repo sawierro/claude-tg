@@ -5,7 +5,7 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "claude_tg.db"
+DB_PATH = str(Path(__file__).resolve().parent.parent / "claude_tg.db")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (

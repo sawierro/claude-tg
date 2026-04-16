@@ -10,11 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bot.config import Config
-from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession
+from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
 
 logger = logging.getLogger(__name__)
 
-_ENV = os.environ.copy()
+_ENV = None  # inherit current environment (not a frozen copy)
 
 CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -121,23 +121,7 @@ def _wsl_path_to_windows(distro: str, linux_path: str) -> Path:
     return Path(fallback) / rel
 
 
-def _is_process_alive(pid: int) -> bool:
-    """Check if a process with given PID is running."""
-    if platform.system() == "Windows":
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+_is_process_alive = is_process_alive  # backward compat
 
 
 def _read_tail_lines(path: Path, n: int = 10) -> list[str]:
@@ -597,14 +581,4 @@ class ClaudeProvider(CLIProvider):
         return "".join(text_parts).strip() if text_parts else None
 
 
-async def _kill_process(process: asyncio.subprocess.Process) -> None:
-    """Gracefully terminate, then force kill after 5 seconds."""
-    try:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-    except ProcessLookupError:
-        pass
+_kill_process = kill_process  # backward compat

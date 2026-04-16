@@ -68,14 +68,20 @@ def split_message(text: str, max_length: int = 4000) -> list[str]:
             chunk = remaining[:split_at]
             remaining = remaining[split_at:]
 
-        # Ensure code blocks are closed
-        open_blocks = chunk.count("```")
-        if open_blocks % 2 == 1:
+        # Track code block state across chunks
+        # Count only standalone ``` (not inside inline code)
+        triple_count = chunk.count("```")
+        if in_code_block:
+            # Previous chunk left a code block open — reopen it
+            chunk = "```\n" + chunk
+            triple_count += 1
+
+        if triple_count % 2 == 1:
+            # Odd number of ``` means a block is left open — close it
             chunk += "\n```"
             in_code_block = True
-        elif in_code_block:
-            chunk = "```\n" + chunk
-            in_code_block = chunk.count("```") % 2 == 1
+        else:
+            in_code_block = False
 
         chunks.append(chunk.strip())
 

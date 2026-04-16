@@ -96,8 +96,14 @@ def main() -> None:
                 try:
                     loop.add_signal_handler(sig, signal_handler)
                 except NotImplementedError:
-                    # Windows doesn't support add_signal_handler
                     pass
+
+            # Windows fallback: signal.signal works for SIGINT/Ctrl+C
+            if sys.platform == "win32":
+                def _win_handler(signum, frame):
+                    loop.call_soon_threadsafe(stop_event.set)
+                signal.signal(signal.SIGINT, _win_handler)
+                signal.signal(signal.SIGTERM, _win_handler)
 
             try:
                 await stop_event.wait()
