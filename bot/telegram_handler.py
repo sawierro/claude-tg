@@ -2,6 +2,7 @@ import json
 import logging
 import functools
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,6 +26,9 @@ from bot.message_formatter import (
     split_message,
 )
 from bot.external_sessions import list_external_sessions, find_session_by_query
+from bot import prompts as prompts_module
+from bot import updater as updater_module
+from bot import limit_detector
 
 logger = logging.getLogger(__name__)
 
@@ -177,10 +181,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/get <file>` \\- Скачать файл из проекта\n"
         "`/stop <name>` \\- Отключить сессию\n"
         "`/sync` \\- Записать сводку в файл для терминала\n"
-        "`/cancel` \\- Прервать текущую работу\n\n"
+        "`/cancel` \\- Прервать текущую работу\n"
+        "`/ping [name]` \\- Проверить статус сессии\n"
+        "`/usage [name]` \\- Расход токенов за 5ч/24ч/всё время\n"
+        "`/pending` \\- Очередь сообщений при сбросе лимита\n"
+        "`/update` \\- Проверить обновления бота\n\n"
         "*Файлы:*\n"
         "\\- `/get README\\.md` \\- скачать файл\n"
         "\\- Отправьте файл \\- сохранится в work\\_dir\n\n"
+        "*Шаблоны промптов:*\n"
+        "`/prompts` \\- список шаблонов\n"
+        "`/prompt <имя>` \\- отправить шаблон в сессию\n"
+        "`/prompt_del <имя>` \\- удалить шаблон\n"
+        "\\- Отправьте `\\.md`/`\\.txt` с подписью `\\#prompt` \\- сохранить\n\n"
         "*Доступ:*\n"
         "`/viewers` \\- запросы и наблюдатели\n"
         "`/approve <id>` \\- одобрить запрос\n"
@@ -345,6 +358,307 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Format a duration in a compact human-readable form."""
+    if seconds < 60:
+        return f"{int(seconds)} сек"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} мин {int(seconds % 60)} сек"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours} ч {minutes} мин"
+
+
+def _fmt_num(n: int) -> str:
+    """Format integer with thin-space thousand separators."""
+    return f"{n:,}".replace(",", "\u2009")
+
+
+@authorized
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /usage [name] — show token usage for a session (and overall)."""
+    from bot import db as db_module
+
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = session_mgr.conn
+
+    session = None
+    if context.args:
+        name = context.args[0]
+        session = await db_module.get_session_by_name(conn, name)
+        if not session:
+            session = await db_module.get_session(conn, name)
+        if not session:
+            await _safe_reply(update.message, format_error(f"Сессия '{name}' не найдена"))
+            return
+    else:
+        remembered_id = context.user_data.get("active_session_id")
+        if remembered_id:
+            session = await db_module.get_session(conn, remembered_id)
+        if not session:
+            active = await session_mgr.list_sessions()
+            waiting = [s for s in active if s["status"] in ("running", "waiting")]
+            if len(waiting) == 1:
+                session = waiting[0]
+
+    lines = []
+    if session:
+        name_esc = escape_markdown_v2(session["name"])
+        provider_esc = escape_markdown_v2(session.get("provider", "claude"))
+        lines.append(f"*Сессия:* `{name_esc}` \\({provider_esc}\\)")
+
+        for label, since in (("5 ч", "-5 hours"), ("24 ч", "-24 hours"), ("всё время", None)):
+            t_in, t_out, n = await db_module.get_token_usage(conn, session["id"], since)
+            total = t_in + t_out
+            lines.append(
+                f"  *{escape_markdown_v2(label)}*: "
+                f"{_fmt_num(total)} токенов "
+                f"\\(in `{_fmt_num(t_in)}` / out `{_fmt_num(t_out)}`, {n} запросов\\)"
+            )
+        lines.append("")
+
+    lines.append("*По всем сессиям:*")
+    for label, since in (("5 ч", "-5 hours"), ("24 ч", "-24 hours"), ("всё время", None)):
+        t_in, t_out, n = await db_module.get_token_usage(conn, None, since)
+        total = t_in + t_out
+        lines.append(
+            f"  *{escape_markdown_v2(label)}*: "
+            f"{_fmt_num(total)} токенов "
+            f"\\(in `{_fmt_num(t_in)}` / out `{_fmt_num(t_out)}`, {n} запросов\\)"
+        )
+
+    lines.append("")
+    lines.append(escape_markdown_v2(
+        "Лимит сбрасывается каждые 5 часов (Claude rolling window). "
+        "Реальный остаток с сервера недоступен — это локальный счётчик."
+    ))
+
+    await _safe_reply(update.message, "\n".join(lines))
+
+
+@authorized
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /pending — list queued prompts waiting for limit reset."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = session_mgr.conn
+
+    items = await db_module.list_pending_prompts(conn)
+    if not items:
+        await _safe_reply(update.message, "Нет отложенных сообщений\\.")
+        return
+
+    lines = ["*Отложенные сообщения:*\n"]
+    for p in items:
+        session = await db_module.get_session(conn, p["session_id"])
+        name = session["name"] if session else p["session_id"][:8]
+        name_esc = escape_markdown_v2(name)
+        mode_emoji = "\U0001f504" if p["mode"] == "auto" else "\U0001f514"
+        preview = (p["prompt"][:60] + "...") if len(p["prompt"]) > 60 else p["prompt"]
+        lines.append(
+            f"`#{p['id']}` {mode_emoji} `{name_esc}` "
+            f"\u2192 `{escape_markdown_v2(p['retry_at'])} UTC`\n"
+            f"    _{escape_markdown_v2(preview)}_"
+        )
+
+    await _safe_reply(update.message, "\n".join(lines))
+
+
+@authorized
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /update — check GitHub for bot updates and offer to pull."""
+    if not await updater_module.is_git_repo():
+        await _safe_reply(update.message, format_error("Не git\\-репозиторий"))
+        return
+
+    processing = await update.message.reply_text(
+        "\u23f3 Проверяю обновления\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        ok, err = await updater_module.fetch()
+    except RuntimeError as e:
+        await processing.edit_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    if not ok:
+        await processing.edit_text(
+            format_error(f"git fetch: {err}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    branch = await updater_module.current_branch() or "main"
+    cur = await updater_module.current_commit()
+    commits = await updater_module.pending_commits(branch)
+
+    if not commits:
+        await processing.edit_text(
+            f"\u2705 Уже последняя версия \\(`{escape_markdown_v2(cur)}` на `{escape_markdown_v2(branch)}`\\)",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    dirty = await updater_module.is_working_tree_dirty()
+
+    lines = [
+        f"\U0001f4e5 *Доступно обновлений:* {len(commits)}",
+        f"Текущий коммит: `{escape_markdown_v2(cur)}` \\(`{escape_markdown_v2(branch)}`\\)",
+        "",
+        "*Новые коммиты:*",
+    ]
+    for c in commits[:15]:
+        lines.append(f"\\- `{escape_markdown_v2(c)}`")
+    if len(commits) > 15:
+        lines.append(f"\\.\\.\\.и ещё {len(commits) - 15}")
+
+    if dirty:
+        lines.append("")
+        lines.append("\U0001f7e1 В рабочей копии есть локальные изменения \\- pull отменён\\.")
+        await processing.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("\u2b07 Обновить (git pull)", callback_data=f"upd:pull:{branch}")]]
+    )
+    await processing.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=keyboard,
+    )
+
+
+async def _handle_update_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /update confirmation callback."""
+    parts = query.data.split(":", 2)
+    branch = parts[2] if len(parts) >= 3 else "main"
+
+    await query.edit_message_text(
+        "\u23f3 Выполняю git pull\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        ok, out = await updater_module.pull(branch)
+    except RuntimeError as e:
+        await query.edit_message_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    if not ok:
+        await query.edit_message_text(
+            format_error(f"git pull: {out}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    new_commit = await updater_module.current_commit()
+    text = (
+        f"\u2705 Обновлено до `{escape_markdown_v2(new_commit)}`\n\n"
+        f"```\n{escape_markdown_v2(out[:500])}\n```\n"
+        f"\U0001f504 Перезапустите бота, чтобы применить изменения\\."
+    )
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+@authorized
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /ping [name] — check if a session is alive or hung."""
+    from bot import db as db_module
+
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+    conn = session_mgr.conn
+
+    session = None
+    if context.args:
+        name_or_sid = context.args[0]
+        session = await db_module.get_session_by_name(conn, name_or_sid)
+        if not session:
+            session = await db_module.get_session(conn, name_or_sid)
+    else:
+        remembered_id = context.user_data.get("active_session_id")
+        if remembered_id:
+            session = await db_module.get_session(conn, remembered_id)
+        if not session:
+            active = await session_mgr.list_sessions()
+            waiting = [s for s in active if s["status"] in ("running", "waiting")]
+            if len(waiting) == 1:
+                session = waiting[0]
+
+    if not session:
+        await _safe_reply(
+            update.message,
+            "Укажите имя сессии: `/ping <name>` или выберите через `/connect`",
+        )
+        return
+
+    status = session["status"]
+    updated_iso = session["updated_at"]
+    try:
+        updated = datetime.fromisoformat(updated_iso.replace(" ", "T")).replace(
+            tzinfo=timezone.utc
+        )
+        elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
+    except (ValueError, AttributeError):
+        elapsed = 0
+
+    last_msg_iso = await db_module.get_last_message_time(conn, session["id"])
+    last_msg_ago = None
+    if last_msg_iso:
+        try:
+            lm = datetime.fromisoformat(last_msg_iso.replace(" ", "T")).replace(
+                tzinfo=timezone.utc
+            )
+            last_msg_ago = (datetime.now(timezone.utc) - lm).total_seconds()
+        except (ValueError, AttributeError):
+            pass
+
+    timeout_s = config.subprocess_timeout_minutes * 60
+
+    if status == "running":
+        if elapsed > timeout_s:
+            emoji = "\U0001f534"  # red
+            health = f"вероятно зависла \\(> {config.subprocess_timeout_minutes} мин\\)"
+        elif elapsed > timeout_s / 2:
+            emoji = "\U0001f7e1"  # yellow
+            health = f"работает долго \\({_format_elapsed(elapsed)}\\)"
+        else:
+            emoji = "\u23f3"  # hourglass
+            health = f"работает \\({_format_elapsed(elapsed)}\\)"
+    elif status == "waiting":
+        emoji = "\U0001f7e2"  # green
+        if last_msg_ago is not None:
+            health = f"ждёт сообщение \\(ответ был {_format_elapsed(last_msg_ago)} назад\\)"
+        else:
+            health = "ждёт сообщение"
+    elif status == "done":
+        emoji = "\u2705"
+        health = "завершена"
+    elif status == "error":
+        emoji = "\U0001f534"
+        health = "ошибка"
+    else:
+        emoji = "\u2753"
+        health = escape_markdown_v2(status)
+
+    name_esc = escape_markdown_v2(session["name"])
+    provider_esc = escape_markdown_v2(session.get("provider", "claude"))
+    wsl = session.get("wsl_distro") or ""
+    wsl_line = f"\n\U0001f427 WSL: `{escape_markdown_v2(wsl)}`" if wsl else ""
+
+    text = (
+        f"{emoji} `{name_esc}` \\({provider_esc}\\){wsl_line}\n"
+        f"Статус: {health}"
+    )
+
+    await _safe_reply(update.message, text)
+
+
 @authorized
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /cancel — kill all running sessions."""
@@ -365,6 +679,81 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Остановлено: `{escape_markdown_v2(names)}`",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
+
+
+@authorized
+async def cmd_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /prompts — list saved prompt templates as inline keyboard."""
+    config: Config = context.bot_data["config"]
+
+    try:
+        names = prompts_module.list_prompts(config.prompts_dir)
+    except OSError as e:
+        await _safe_reply(update.message, format_error(f"Не удалось прочитать каталог: {e}"))
+        return
+
+    if not names:
+        await _safe_reply(
+            update.message,
+            "Нет сохранённых шаблонов\\.\n\n"
+            "Отправьте `\\.md` или `\\.txt` файл с подписью `\\#prompt`\\, "
+            "чтобы сохранить его как шаблон\\.",
+        )
+        return
+
+    keyboard = []
+    for i, name in enumerate(names):
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"pr:{i}")])
+
+    context.user_data["prompt_list"] = names
+    await update.message.reply_text(
+        "*Шаблоны промптов:*\nНажмите для отправки в активную сессию\\.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+@authorized
+async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /prompt <name> — send a prompt template to the active session."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+
+    if not context.args:
+        await _safe_reply(update.message, "Использование: `/prompt <имя>`")
+        return
+
+    name = " ".join(context.args)
+    try:
+        content = prompts_module.read_prompt(config.prompts_dir, name)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
+
+    session = await _find_active_session(update, context, session_mgr)
+    if not session:
+        return
+
+    await _resume_and_reply(update, context, session, content)
+
+
+@authorized
+async def cmd_prompt_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /prompt_del <name> — delete a prompt template."""
+    config: Config = context.bot_data["config"]
+
+    if not context.args:
+        await _safe_reply(update.message, "Использование: `/prompt_del <имя>`")
+        return
+
+    name = " ".join(context.args)
+    try:
+        prompts_module.delete_prompt(config.prompts_dir, name)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
+
+    await _safe_reply(update.message, f"\U0001f5d1 Шаблон `{escape_markdown_v2(name)}` удалён")
 
 
 @authorized
@@ -535,6 +924,89 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_resume_callback(update, query, context)
     elif data.startswith("sync:"):
         await _handle_sync_callback(query, context)
+    elif data.startswith("pr:"):
+        await _handle_prompt_callback(update, query, context)
+    elif data.startswith("upd:"):
+        await _handle_update_callback(query, context)
+    elif data.startswith("lim:"):
+        await _handle_limit_callback(query, context)
+    elif data.startswith("resm_cancel:"):
+        await _handle_resume_cancel_callback(query, context)
+    elif data.startswith("resm:"):
+        await _handle_resume_pending_callback(query, context)
+
+
+async def _handle_prompt_callback(
+    update: Update, query, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle prompt template selection — send content to active session."""
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
+
+    try:
+        idx = int(query.data.split(":", 1)[1])
+    except ValueError:
+        await query.edit_message_text("Неверный выбор\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    names = context.user_data.get("prompt_list") or []
+    if idx < 0 or idx >= len(names):
+        # List may be stale — refresh and retry
+        names = prompts_module.list_prompts(config.prompts_dir)
+        if idx < 0 or idx >= len(names):
+            await query.edit_message_text(
+                "Шаблон не найден \\(список устарел\\)\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+    name = names[idx]
+    try:
+        content = prompts_module.read_prompt(config.prompts_dir, name)
+    except ValueError as e:
+        await query.edit_message_text(
+            format_error(str(e)), parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    # Find active session (same logic as handle_message)
+    session = None
+    remembered_id = context.user_data.get("active_session_id")
+    if remembered_id:
+        from bot import db as db_module
+        remembered = await db_module.get_session(session_mgr.conn, remembered_id)
+        if remembered and remembered["status"] in ("running", "waiting"):
+            session = remembered
+
+    if not session:
+        active = await session_mgr.list_sessions()
+        waiting = [s for s in active if s["status"] == "waiting"]
+        if len(waiting) == 1:
+            session = waiting[0]
+        elif len(waiting) > 1:
+            keyboard = [
+                [InlineKeyboardButton(s["name"], callback_data=f"resume:{s['id']}")]
+                for s in waiting
+            ]
+            context.user_data["pending_prompt"] = content
+            await query.edit_message_text(
+                "Выберите сессию:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+        else:
+            await query.edit_message_text(
+                "Нет активных сессий\\. `/connect` или `/new`",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+
+    await query.edit_message_text(
+        f"\u23f3 Отправляю шаблон `{escape_markdown_v2(name)}` в "
+        f"*{escape_markdown_v2(session['name'])}*\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    await _resume_and_reply(update, context, session, content, edit_message=query.message)
 
 
 async def _handle_sync_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -692,6 +1164,11 @@ async def _resume_and_reply(
     except Exception:
         pass
 
+    # Detect usage/rate limit and offer to queue the prompt for later
+    if response.error and limit_detector.is_limit_error(response.error):
+        await _offer_pending_resume(update, context, session, prompt, response.error)
+        return
+
     status = "error" if response.error else "waiting"
     notification = format_notification(
         session["name"], session["work_dir"], response, status
@@ -707,6 +1184,173 @@ async def _resume_and_reply(
     # Update session with last message ID
     if last_msg:
         await session_mgr.update_tg_message(session["id"], last_msg.message_id)
+
+
+async def _offer_pending_resume(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: dict,
+    prompt: str,
+    error: str,
+) -> None:
+    """On limit error, create a pending_prompt entry and let the user pick the mode."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    chat_id = update.effective_chat.id
+
+    retry_at = limit_detector.parse_reset_time(error)
+    retry_at_iso = retry_at.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Default mode is "manual" — safest: just notify, let user decide then.
+    pending_id = await db_module.create_pending_prompt(
+        session_mgr.conn, session["id"], chat_id, prompt, retry_at_iso, "manual",
+    )
+
+    wait_seconds = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+    wait_str = _format_elapsed(wait_seconds)
+    name_esc = escape_markdown_v2(session["name"])
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "\U0001f504 Auto-resume при сбросе",
+            callback_data=f"lim:auto:{pending_id}",
+        )],
+        [InlineKeyboardButton(
+            "\U0001f514 Просто напомнить (по умолчанию)",
+            callback_data=f"lim:manual:{pending_id}",
+        )],
+        [InlineKeyboardButton(
+            "\u274c Отменить",
+            callback_data=f"lim:cancel:{pending_id}",
+        )],
+    ])
+
+    await update.message.reply_text(
+        (
+            f"\U0001f7e1 *Лимит достигнут для* `{name_esc}`\n"
+            f"Сброс через: {escape_markdown_v2(wait_str)} "
+            f"\\(`{escape_markdown_v2(retry_at_iso)} UTC`\\)\n\n"
+            f"Что делать с сообщением?"
+        ),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=keyboard,
+    )
+
+
+async def _handle_limit_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle limit-mode selection callback: lim:<mode>:<pending_id>."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, mode, pid_str = parts
+    try:
+        pending_id = int(pid_str)
+    except ValueError:
+        return
+
+    pending = await db_module.get_pending_prompt(session_mgr.conn, pending_id)
+    if not pending:
+        await query.edit_message_text(
+            "Запись отложенного сообщения не найдена\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    if mode == "cancel":
+        await db_module.delete_pending_prompt(session_mgr.conn, pending_id)
+        await query.edit_message_text(
+            "\u274c Отложенное сообщение удалено\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    if mode not in ("auto", "manual"):
+        return
+
+    await session_mgr.conn.execute(
+        "UPDATE pending_prompts SET mode=? WHERE id=?", (mode, pending_id)
+    )
+    await session_mgr.conn.commit()
+
+    label = "Auto-resume" if mode == "auto" else "Напоминание"
+    await query.edit_message_text(
+        f"\u2705 Режим: *{escape_markdown_v2(label)}*\\. "
+        f"Сработает при сбросе лимита \\(`{escape_markdown_v2(pending['retry_at'])} UTC`\\)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _handle_resume_pending_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Resume now' click on a manual-mode pending notification."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2:
+        return
+    try:
+        pending_id = int(parts[1])
+    except ValueError:
+        return
+
+    pending = await db_module.get_pending_prompt(session_mgr.conn, pending_id)
+    if not pending:
+        await query.edit_message_text(
+            "Запись не найдена \\(возможно, уже обработана\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    session = await db_module.get_session(session_mgr.conn, pending["session_id"])
+    if not session:
+        await db_module.delete_pending_prompt(session_mgr.conn, pending_id)
+        await query.edit_message_text(
+            "Сессия удалена\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+
+    await query.edit_message_text(
+        f"\u23f3 Возобновляю `{escape_markdown_v2(session['name'])}`\\.\\.\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        await session_mgr.resume_session(pending["session_id"], pending["prompt"])
+    except Exception as e:
+        logger.exception("Manual resume failed")
+        await query.edit_message_text(
+            format_error(f"Не удалось возобновить: {e}"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    finally:
+        await db_module.delete_pending_prompt(session_mgr.conn, pending_id)
+
+    await query.edit_message_text(
+        f"\u2705 `{escape_markdown_v2(session['name'])}` возобновлена\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _handle_resume_cancel_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Cancel' click on a manual-mode pending notification."""
+    from bot import db as db_module
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    parts = query.data.split(":", 1)
+    try:
+        pending_id = int(parts[1])
+    except (ValueError, IndexError):
+        return
+
+    await db_module.delete_pending_prompt(session_mgr.conn, pending_id)
+    await query.edit_message_text(
+        "\u274c Отложенное сообщение отменено\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 
 async def _find_active_session(
@@ -823,11 +1467,17 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle file uploads — save to active session's work_dir."""
+    """Handle file uploads — save to active session's work_dir, or to prompts/ if caption is #prompt."""
     session_mgr: SessionManager = context.bot_data["session_mgr"]
+    config: Config = context.bot_data["config"]
 
     doc = update.message.document
     if not doc:
+        return
+
+    caption = (update.message.caption or "").strip().lower()
+    if caption.startswith("#prompt"):
+        await _save_as_prompt(update, context, doc, config)
         return
 
     session = await _find_active_session(update, context, session_mgr)
@@ -862,6 +1512,56 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _safe_reply(
         update.message,
         f"\u2705 `{esc_name}` \u2192 `{esc_dir}`",
+    )
+
+
+async def _save_as_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, doc, config: Config
+) -> None:
+    """Save uploaded document as a prompt template."""
+    filename = doc.file_name or "prompt.md"
+
+    if doc.file_size and doc.file_size > prompts_module.MAX_FILE_SIZE:
+        await _safe_reply(
+            update.message,
+            format_error(f"Файл больше {prompts_module.MAX_FILE_SIZE // 1024} КБ"),
+        )
+        return
+
+    try:
+        name = prompts_module.validate_filename(filename)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix) as tf:
+        tmp_path = tf.name
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(tmp_path)
+        content = Path(tmp_path).read_bytes()
+    except Exception as e:
+        logger.exception("Failed to download prompt file")
+        await _safe_reply(update.message, format_error(f"Ошибка загрузки: {e}"))
+        return
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    try:
+        prompts_module.save_prompt(config.prompts_dir, name, content)
+    except ValueError as e:
+        await _safe_reply(update.message, format_error(str(e)))
+        return
+
+    await _safe_reply(
+        update.message,
+        f"\u2705 Шаблон `{escape_markdown_v2(name)}` сохранён\\.\n"
+        f"Отправить: `/prompt {escape_markdown_v2(name)}` или `/prompts`",
     )
 
 
@@ -1140,6 +1840,13 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("prompts", cmd_prompts))
+    app.add_handler(CommandHandler("prompt", cmd_prompt))
+    app.add_handler(CommandHandler("prompt_del", cmd_prompt_del))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

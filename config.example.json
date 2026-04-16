@@ -6,5 +6,6 @@
     "claude_flags": [],
     "max_message_length": 4000,
     "session_timeout_hours": 24,
-    "subprocess_timeout_minutes": 30
+    "subprocess_timeout_minutes": 30,
+    "prompts_dir": "prompts"
 }

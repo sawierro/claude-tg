@@ -22,6 +22,7 @@ class Config:
     max_message_length: int = 4000
     session_timeout_hours: int = 24
     subprocess_timeout_minutes: int = 30
+    prompts_dir: str = "prompts"
 
     def save(self, path: str = DEFAULT_CONFIG_PATH) -> None:
         """Save current config to JSON file (token excluded — use .env)."""
@@ -33,6 +34,7 @@ class Config:
             "max_message_length": self.max_message_length,
             "session_timeout_hours": self.session_timeout_hours,
             "subprocess_timeout_minutes": self.subprocess_timeout_minutes,
+            "prompts_dir": self.prompts_dir,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
@@ -69,4 +71,5 @@ def load_config(path: str | None = None) -> Config:
         max_message_length=data.get("max_message_length", 4000),
         session_timeout_hours=data.get("session_timeout_hours", 24),
         subprocess_timeout_minutes=data.get("subprocess_timeout_minutes", 30),
+        prompts_dir=data.get("prompts_dir", "prompts"),
     )

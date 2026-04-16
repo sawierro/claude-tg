@@ -12,6 +12,8 @@ from bot.db import (
     delete_session,
     insert_message,
     cleanup_stale_sessions,
+    get_token_usage,
+    get_last_message_time,
 )
 
 
@@ -98,3 +100,34 @@ async def test_unique_session_name(conn):
     await create_session(conn, "sid-9", "unique-name", "/tmp")
     with pytest.raises(Exception):
         await create_session(conn, "sid-10", "unique-name", "/tmp")
+
+
+@pytest.mark.asyncio
+async def test_token_usage_aggregation(conn):
+    await create_session(conn, "sid-t1", "tok-a", "/tmp")
+    await create_session(conn, "sid-t2", "tok-b", "/tmp")
+    await insert_message(conn, "sid-t1", "user", "q1")
+    await insert_message(conn, "sid-t1", "assistant", "r1", tokens_in=100, tokens_out=50)
+    await insert_message(conn, "sid-t1", "assistant", "r2", tokens_in=200, tokens_out=75)
+    await insert_message(conn, "sid-t2", "assistant", "r3", tokens_in=10, tokens_out=5)
+
+    # Per-session (all-time)
+    t_in, t_out, n = await get_token_usage(conn, "sid-t1", None)
+    assert t_in == 300
+    assert t_out == 125
+    assert n == 2
+
+    # Across all sessions
+    t_in, t_out, n = await get_token_usage(conn, None, None)
+    assert t_in == 310
+    assert t_out == 130
+    assert n == 3
+
+
+@pytest.mark.asyncio
+async def test_get_last_message_time(conn):
+    await create_session(conn, "sid-lm", "last-msg", "/tmp")
+    assert await get_last_message_time(conn, "sid-lm") is None
+    await insert_message(conn, "sid-lm", "user", "hi")
+    ts = await get_last_message_time(conn, "sid-lm")
+    assert ts is not None

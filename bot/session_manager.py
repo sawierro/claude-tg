@@ -74,6 +74,8 @@ class SessionManager:
         await db.insert_message(
             self.conn, response.session_id, "assistant",
             response.error or response.text,
+            tokens_in=response.tokens_in,
+            tokens_out=response.tokens_out,
         )
 
         return response
@@ -119,7 +121,9 @@ class SessionManager:
 
         await db.insert_message(self.conn, session_id, "user", prompt)
         await db.insert_message(
-            self.conn, session_id, "assistant", response.error or response.text
+            self.conn, session_id, "assistant", response.error or response.text,
+            tokens_in=response.tokens_in,
+            tokens_out=response.tokens_out,
         )
 
         return response

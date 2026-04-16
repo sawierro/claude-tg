@@ -378,12 +378,23 @@ class ClaudeProvider(CLIProvider):
             cost = data.get("total_cost_usd") or data.get("cost_usd") or data.get("cost")
             is_error = data.get("is_error", False)
 
+            usage = data.get("usage") or {}
+            t_in = usage.get("input_tokens")
+            t_out = usage.get("output_tokens")
+            # Include cached input tokens in total_in for a realistic cost picture
+            cache_read = usage.get("cache_read_input_tokens") or 0
+            cache_creation = usage.get("cache_creation_input_tokens") or 0
+            if t_in is not None:
+                t_in = int(t_in) + int(cache_read) + int(cache_creation)
+
             return ProviderResponse(
                 session_id=sid,
                 text=result_text if not is_error else "",
                 cost=float(cost) if cost is not None else None,
                 duration_seconds=duration,
                 error=result_text if is_error else None,
+                tokens_in=int(t_in) if t_in is not None else None,
+                tokens_out=int(t_out) if t_out is not None else None,
             )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning("Failed to parse Claude JSON: %s", e)

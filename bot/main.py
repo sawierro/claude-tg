@@ -12,6 +12,7 @@ from bot.db import init_db, cleanup_stale_sessions, reset_running_sessions
 from bot.session_manager import SessionManager
 from bot.telegram_handler import setup_handlers
 from bot.providers.claude import ClaudeProvider
+from bot.resume_worker import resume_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +84,9 @@ def main() -> None:
             await app.start()
             await app.updater.start_polling()
 
+            # Background: auto-resume worker
+            worker_task = asyncio.create_task(resume_worker(app, session_mgr))
+
             logger.info("Bot is running. Press Ctrl+C to stop.")
 
             # Wait until stopped
@@ -111,6 +115,11 @@ def main() -> None:
                 pass
 
             logger.info("Shutting down...")
+            worker_task.cancel()
+            try:
+                await worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
             await app.updater.stop()
             await app.stop()
 

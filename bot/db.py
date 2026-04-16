@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role            TEXT NOT NULL CHECK(role IN ('user','assistant')),
     content         TEXT NOT NULL,
     tg_message_id   INTEGER,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -49,6 +51,18 @@ CREATE TABLE IF NOT EXISTS session_viewers (
     session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     PRIMARY KEY (chat_id, session_id)
 );
+
+CREATE TABLE IF NOT EXISTS pending_prompts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    chat_id         INTEGER NOT NULL,
+    prompt          TEXT NOT NULL,
+    retry_at        TEXT NOT NULL,
+    mode            TEXT NOT NULL CHECK(mode IN ('auto','manual')),
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_retry ON pending_prompts(retry_at);
 """
 
 
@@ -76,6 +90,15 @@ async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
         await conn.execute("ALTER TABLE sessions ADD COLUMN wsl_distro TEXT NOT NULL DEFAULT ''")
         await conn.commit()
         logger.info("Migrated: added wsl_distro column to sessions")
+
+    # Migration: add tokens_in/tokens_out columns if missing
+    try:
+        await conn.execute("SELECT tokens_in FROM messages LIMIT 1")
+    except Exception:
+        await conn.execute("ALTER TABLE messages ADD COLUMN tokens_in INTEGER")
+        await conn.execute("ALTER TABLE messages ADD COLUMN tokens_out INTEGER")
+        await conn.commit()
+        logger.info("Migrated: added tokens_in/tokens_out columns to messages")
 
     logger.info("Database initialized at %s", db_path)
     return conn
@@ -172,13 +195,44 @@ async def insert_message(
     role: str,
     content: str,
     tg_message_id: int | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
 ) -> None:
     """Insert a message into the history."""
     await conn.execute(
-        "INSERT INTO messages (session_id, role, content, tg_message_id) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, tg_message_id),
+        "INSERT INTO messages (session_id, role, content, tg_message_id, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?)",
+        (session_id, role, content, tg_message_id, tokens_in, tokens_out),
     )
     await conn.commit()
+
+
+async def get_token_usage(
+    conn: aiosqlite.Connection,
+    session_id: str | None = None,
+    since: str | None = None,
+) -> tuple[int, int, int]:
+    """Return (sum_in, sum_out, message_count) for usage aggregation.
+
+    If session_id is None, aggregates across all sessions.
+    If since is None, aggregates all-time. Otherwise since is SQLite datetime string
+    (e.g. '-5 hours', '-24 hours').
+    """
+    where = ["role='assistant'"]
+    params: list = []
+    if session_id is not None:
+        where.append("session_id=?")
+        params.append(session_id)
+    if since is not None:
+        where.append("created_at >= datetime('now', ?)")
+        params.append(since)
+
+    sql = (
+        "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COUNT(*) "
+        "FROM messages WHERE " + " AND ".join(where)
+    )
+    async with conn.execute(sql, params) as cur:
+        row = await cur.fetchone()
+        return (int(row[0]), int(row[1]), int(row[2])) if row else (0, 0, 0)
 
 
 async def get_session_messages(conn: aiosqlite.Connection, session_id: str) -> list[dict]:
@@ -189,6 +243,17 @@ async def get_session_messages(conn: aiosqlite.Connection, session_id: str) -> l
     ) as cur:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+async def get_last_message_time(
+    conn: aiosqlite.Connection, session_id: str
+) -> str | None:
+    """Return ISO timestamp of the most recent message for a session, or None."""
+    async with conn.execute(
+        "SELECT MAX(created_at) FROM messages WHERE session_id=?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
 
 
 async def reset_running_sessions(conn: aiosqlite.Connection) -> int:
@@ -315,3 +380,63 @@ async def get_viewer_session_ids(
     ) as cur:
         rows = await cur.fetchall()
         return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# pending_prompts — queue for auto-resume after limit reset
+# ---------------------------------------------------------------------------
+
+async def create_pending_prompt(
+    conn: aiosqlite.Connection,
+    session_id: str,
+    chat_id: int,
+    prompt: str,
+    retry_at: str,
+    mode: str,
+) -> int:
+    """Insert a pending prompt. retry_at is ISO datetime. Returns row id."""
+    cursor = await conn.execute(
+        "INSERT INTO pending_prompts (session_id, chat_id, prompt, retry_at, mode) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_id, chat_id, prompt, retry_at, mode),
+    )
+    await conn.commit()
+    return cursor.lastrowid
+
+
+async def get_pending_prompt(
+    conn: aiosqlite.Connection, pending_id: int
+) -> dict | None:
+    """Get a pending prompt by id."""
+    async with conn.execute(
+        "SELECT * FROM pending_prompts WHERE id=?", (pending_id,)
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_due_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
+    """Return pending prompts whose retry_at has passed."""
+    async with conn.execute(
+        "SELECT * FROM pending_prompts WHERE retry_at <= datetime('now') "
+        "ORDER BY retry_at ASC"
+    ) as cur:
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def delete_pending_prompt(
+    conn: aiosqlite.Connection, pending_id: int
+) -> None:
+    """Delete a pending prompt entry."""
+    await conn.execute("DELETE FROM pending_prompts WHERE id=?", (pending_id,))
+    await conn.commit()
+
+
+async def list_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
+    """List all pending prompts ordered by retry_at."""
+    async with conn.execute(
+        "SELECT * FROM pending_prompts ORDER BY retry_at ASC"
+    ) as cur:
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]

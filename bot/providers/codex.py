@@ -261,6 +261,8 @@ class CodexProvider(CLIProvider):
         session_id = fallback_sid or ""
         final_text = ""
         error = None
+        tokens_in: int | None = None
+        tokens_out: int | None = None
 
         # Codex outputs newline-delimited JSON events
         for line in raw.strip().split("\n"):
@@ -300,6 +302,16 @@ class CodexProvider(CLIProvider):
             if event_type == "turn.failed":
                 error = event.get("error", {}).get("message", "Turn failed")
 
+            # Usage metrics may appear on turn.completed or as a dedicated event
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                t_in = usage.get("input_tokens") or usage.get("prompt_tokens")
+                t_out = usage.get("output_tokens") or usage.get("completion_tokens")
+                if t_in is not None:
+                    tokens_in = int(t_in)
+                if t_out is not None:
+                    tokens_out = int(t_out)
+
         # Fallback: if no structured events, use raw stdout as text
         if not final_text and not error:
             final_text = raw
@@ -310,6 +322,8 @@ class CodexProvider(CLIProvider):
             cost=None,
             duration_seconds=duration,
             error=error,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
         )
 
     def list_sessions(self) -> list[ProviderSession]:
