@@ -12,11 +12,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
+from bot.providers import _tracking
+from bot.providers._env import build_subprocess_env
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
 
 logger = logging.getLogger(__name__)
-
-_ENV = None  # inherit current environment (not a frozen copy)
 
 CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -226,7 +226,6 @@ class ClaudeProvider(CLIProvider):
         if session_id:
             args.extend(["--resume", session_id])
         args.extend(["-p", prompt])
-        args.extend(["--dangerously-skip-permissions"])
         args.extend(self.config.claude_flags)
         args.extend(["--output-format", "json"])
         return args
@@ -237,7 +236,6 @@ class ClaudeProvider(CLIProvider):
         if session_id:
             parts.extend(["--resume", session_id])
         parts.extend(["-p", json.dumps(prompt)])
-        parts.extend(["--dangerously-skip-permissions"])
         parts.extend(self.config.claude_flags)
         parts.extend(["--output-format", "json"])
         return " ".join(parts)
@@ -264,17 +262,14 @@ class ClaudeProvider(CLIProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir,
-                env=_ENV,
+                env=build_subprocess_env(),
             )
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                if timeout_seconds > 0:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                else:
-                    stdout, stderr = await process.communicate()
+                stdout, stderr = await _tracking.communicate_tracked(
+                    process, timeout_seconds
+                )
             except TimeoutError:
                 logger.warning("Claude timed out after %ds", timeout_seconds)
                 await _kill_process(process)
@@ -336,15 +331,13 @@ class ClaudeProvider(CLIProvider):
         # Resolve actual claude path inside WSL (handles nvm/npm installs)
         claude_bin = _resolve_wsl_cli(wsl_distro, "claude")
 
-        # Build inner command for Linux shell
-        parts = [claude_bin]
+        # Build inner command for Linux shell — quote every argument with shlex
+        import shlex
+        parts = [shlex.quote(claude_bin)]
         if session_id:
-            parts.extend(["--resume", session_id])
-        # Escape single quotes for bash single-quoted string
-        escaped_prompt = prompt.replace("'", "'\\''")
-        parts.extend(["-p", f"'{escaped_prompt}'"])
-        parts.extend(["--dangerously-skip-permissions"])
-        parts.extend(self.config.claude_flags)
+            parts.extend(["--resume", shlex.quote(session_id)])
+        parts.extend(["-p", shlex.quote(prompt)])
+        parts.extend(shlex.quote(flag) for flag in self.config.claude_flags)
         parts.extend(["--output-format", "json"])
         inner_cmd = " ".join(parts)
 
@@ -364,16 +357,14 @@ class ClaudeProvider(CLIProvider):
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=build_subprocess_env(),
             )
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                if timeout_seconds > 0:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                else:
-                    stdout, stderr = await process.communicate()
+                stdout, stderr = await _tracking.communicate_tracked(
+                    process, timeout_seconds
+                )
             except TimeoutError:
                 logger.warning("Claude (WSL) timed out after %ds", timeout_seconds)
                 await _kill_process(process)

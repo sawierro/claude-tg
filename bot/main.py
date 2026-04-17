@@ -7,6 +7,7 @@ from telegram.ext import Application
 
 from bot.config import load_config
 from bot.db import cleanup_stale_sessions, init_db, reset_running_sessions
+from bot.providers import _tracking
 from bot.providers.claude import ClaudeProvider
 from bot.resume_worker import resume_worker
 from bot.session_manager import SessionManager
@@ -23,10 +24,7 @@ logger = logging.getLogger(__name__)
 async def post_init(app: Application) -> None:
     """Run after bot initialization."""
     config = app.bot_data["config"]
-    if not config.allowed_chat_ids:
-        logger.info("Registration mode: waiting for first /start to auto-register chat_id")
-    else:
-        logger.info("Bot ready. Allowed chat IDs: %s", config.allowed_chat_ids)
+    logger.info("Bot ready. Allowed chat IDs: %s", config.allowed_chat_ids)
 
 
 async def post_shutdown(app: Application) -> None:
@@ -118,6 +116,9 @@ def main() -> None:
                 await worker_task
             except (asyncio.CancelledError, Exception):
                 pass
+            killed = await _tracking.kill_all()
+            if killed:
+                logger.info("Killed %d in-flight CLI subprocess(es) on shutdown", killed)
             await app.updater.stop()
             await app.stop()
 

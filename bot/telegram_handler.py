@@ -25,6 +25,7 @@ from bot.message_formatter import (
     format_notification,
     split_message,
 )
+from bot.rate_limiter import RateLimiter
 from bot.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,12 @@ async def _handle_access_request(
                 "Ваш запрос на доступ на рассмотрении\\. Ожидайте\\.",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
-        # denied — silently ignore
+        elif user["role"] == "denied":
+            # Single terse reply — no spammy notifications but no silent ignore either
+            await update.message.reply_text(
+                "Доступ к боту запрещён администратором\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
         return
 
     # New user — create request and notify owner
@@ -126,7 +132,7 @@ async def _handle_access_request(
 
 
 def authorized(func):
-    """Decorator: only allow owner chat IDs. Others get access request flow."""
+    """Decorator: only allow owner chat IDs. Non-owners go through access-request flow."""
 
     @functools.wraps(func)
     async def wrapper(
@@ -135,22 +141,20 @@ def authorized(func):
         config: Config = context.bot_data["config"]
         chat_id = update.effective_chat.id
 
-        # Registration mode: auto-register first user only
-        if not config.allowed_chat_ids:
-            config.allowed_chat_ids.append(chat_id)
-            config.save()
-            logger.info("Auto-registered chat_id %d", chat_id)
-            await update.message.reply_text(
-                f"Регистрация завершена\\! Ваш chat\\_id: `{chat_id}`\n"
-                f"Отправьте /help для списка команд\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
-
         if _is_owner(chat_id, config):
+            limiter: RateLimiter | None = context.bot_data.get("rate_limiter")
+            if limiter is not None and not limiter.check(chat_id):
+                logger.warning("Rate limit hit for owner chat_id=%d", chat_id)
+                if update.message:
+                    await update.message.reply_text(
+                        f"\u26d4 Лимит {config.rate_limit_per_minute} сообщений/мин\\. "
+                        f"Подождите и попробуйте снова\\.",
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    )
+                return
             return await func(update, context, *args, **kwargs)
 
-        # Non-owner — handle access request
+        # Non-owner — handle access request (creates/updates bot_users row)
         await _handle_access_request(update, context, config)
 
     return wrapper
@@ -746,22 +750,29 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cancel — kill all running sessions."""
-    session_mgr: SessionManager = context.bot_data["session_mgr"]
-    sessions = await session_mgr.list_sessions()
-    running = [s for s in sessions if s["status"] == "running"]
+    """Handle /cancel — kill all in-flight CLI subprocesses."""
+    from bot.providers import _tracking
 
-    if not running:
-        await update.message.reply_text("Нет активных процессов для отмены\\.",
-                                         parse_mode=ParseMode.MARKDOWN_V2)
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    active_procs = _tracking.active_count()
+    if active_procs == 0:
+        await update.message.reply_text(
+            "Нет активных процессов для отмены\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return
 
-    for s in running:
-        await session_mgr.stop_session(s["id"])
+    killed = await _tracking.kill_all()
 
-    names = ", ".join(s["name"] for s in running)
+    # Also mark any running sessions in DB as 'done' so UI reflects reality
+    sessions = await session_mgr.list_sessions()
+    for s in sessions:
+        if s["status"] == "running":
+            await session_mgr.stop_session(s["id"])
+
     await update.message.reply_text(
-        f"Остановлено: `{escape_markdown_v2(names)}`",
+        f"\U0001f7e2 Убито процессов: {killed}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -1467,18 +1478,37 @@ async def _find_active_session(
         return None
 
 
-_SENSITIVE_FILES = {
+_SENSITIVE_NAMES = {
+    # Bot & project secrets
     "config.json", ".env", "claude_tg.db",
-    ".env.local", ".env.production", ".env.development",
-    "secrets.json", "credentials.json",
-    "id_rsa", "id_ed25519", ".pgpass",
+    ".env.local", ".env.production", ".env.development", ".env.staging",
+    "secrets.json", "credentials.json", "credentials",
+    # SSH / PGP / cloud
+    "id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", "known_hosts",
+    ".pgpass", ".bashrc", ".zshrc", ".bash_history", ".zsh_history",
+    ".npmrc", ".pypirc", ".netrc", ".gitconfig",
+    # CMS/framework common leaks
+    "wp-config.php", "local.xml", "parameters.yml",
 }
+_SENSITIVE_SUFFIXES = {
+    ".pem", ".key", ".p12", ".pfx", ".crt", ".cer",
+    ".gpg", ".kdbx", ".kdb", ".keychain", ".asc",
+}
+_SENSITIVE_DIRS = {
+    ".git", ".ssh", ".aws", ".gnupg", ".gpg", ".gcloud",
+    ".azure", ".kube", ".docker", ".vscode", ".idea",
+}
+MAX_FILE_DOWNLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
 def _resolve_work_path(session: dict, rel_path: str) -> Path:
     """Resolve a relative path against session's work_dir, handling WSL.
 
-    Raises ValueError on path traversal or access to sensitive files.
+    Raises ValueError on:
+      - path traversal (escape via `..` or absolute path or out-of-tree symlink)
+      - sensitive file names / suffixes / directory components
+    Uses os.path.realpath which follows symlinks — any symlink pointing outside
+    the work dir will fail the boundary check.
     """
     work_dir = session["work_dir"]
     wsl_distro = session.get("wsl_distro", "")
@@ -1489,16 +1519,28 @@ def _resolve_work_path(session: dict, rel_path: str) -> Path:
     else:
         base = Path(work_dir)
 
-    resolved = (base / rel_path).resolve()
-    base_resolved = base.resolve()
+    # realpath to follow symlinks (so any escape via symlink is neutralised)
+    resolved = Path(os.path.realpath(base / rel_path))
+    base_resolved = Path(os.path.realpath(base))
 
-    # Prevent path traversal (os.sep suffix prevents /project_evil matching /project)
+    # Boundary check: os.sep suffix prevents /project_evil matching /project
     if resolved != base_resolved and not str(resolved).startswith(str(base_resolved) + os.sep):
         raise ValueError("Выход за пределы рабочей директории")
 
-    # Block sensitive files
-    if resolved.name in _SENSITIVE_FILES:
+    name_lower = resolved.name.lower()
+    if name_lower in _SENSITIVE_NAMES:
         raise ValueError(f"Доступ к {resolved.name} запрещён")
+    if resolved.suffix.lower() in _SENSITIVE_SUFFIXES:
+        raise ValueError(f"Доступ к {resolved.suffix} файлам запрещён")
+
+    # Reject anything inside sensitive subdirectories
+    try:
+        rel_parts = resolved.relative_to(base_resolved).parts
+    except ValueError:
+        rel_parts = ()
+    for part in rel_parts[:-1]:  # skip leaf itself
+        if part.lower() in _SENSITIVE_DIRS:
+            raise ValueError(f"Каталог {part} запрещён")
 
     return resolved
 
@@ -1533,6 +1575,21 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not file_path.is_file():
         await _safe_reply(update.message, format_error(f"Не файл: {rel_path}"))
+        return
+
+    try:
+        file_size = file_path.stat().st_size
+    except OSError as e:
+        await _safe_reply(update.message, format_error(f"stat: {e}"))
+        return
+    if file_size > MAX_FILE_DOWNLOAD_BYTES:
+        await _safe_reply(
+            update.message,
+            format_error(
+                f"Файл слишком большой: {file_size // (1024*1024)} МБ "
+                f"\\(лимит {MAX_FILE_DOWNLOAD_BYTES // (1024*1024)} МБ\\)"
+            ),
+        )
         return
 
     try:
@@ -1870,6 +1927,7 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     """Register all handlers with the Telegram application."""
     app.bot_data["config"] = config
     app.bot_data["session_mgr"] = session_mgr
+    app.bot_data["rate_limiter"] = RateLimiter(config.rate_limit_per_minute)
 
     # Set up watcher callback — forwards terminal responses to owner + viewers
     async def on_terminal_response(session_id: str, session_name: str, text: str):

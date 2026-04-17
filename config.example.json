@@ -1,12 +1,15 @@
 {
-    "telegram_token": "",
     "allowed_chat_ids": [],
     "default_work_dir": ".",
     "claude_path": "claude.cmd",
-    "claude_flags": [],
+    "claude_flags": ["--dangerously-skip-permissions"],
+    "codex_path": "codex.cmd",
+    "codex_flags": ["--yolo"],
     "max_message_length": 4000,
     "session_timeout_hours": 24,
-    "subprocess_timeout_minutes": 0,
+    "subprocess_timeout_minutes": 30,
     "prompts_dir": "prompts",
-    "auto_continue_prompt": "Продолжи с того места, где остановился."
+    "auto_continue_prompt": "Продолжи с того места, где остановился.",
+    "rate_limit_per_minute": 30,
+    "concurrent_sessions": 3
 }

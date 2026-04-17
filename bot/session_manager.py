@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import uuid
 from pathlib import Path
@@ -17,7 +16,8 @@ class SessionManager:
     def __init__(self, config: Config, conn: aiosqlite.Connection):
         self.config = config
         self.conn = conn
-        self._running_tasks: dict[str, asyncio.Task] = {}
+        # Active subprocesses are tracked at module level in bot.providers._tracking
+        # (kill-all on shutdown, /cancel). Don't duplicate here.
         self._watchers: dict[str, SessionWatcher] = {}
         self._watcher_callback = None
         self._limit_callback = None
@@ -134,15 +134,11 @@ class SessionManager:
         return response
 
     async def stop_session(self, session_id: str) -> None:
-        """Stop a session and mark it as done."""
-        task = self._running_tasks.pop(session_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        """Stop a session's watcher and mark it done in the DB.
 
+        Any in-flight CLI subprocess for this session is killed via the global
+        tracker in bot.providers._tracking on /cancel or shutdown — not here.
+        """
         self._stop_watcher(session_id)
         await db.update_session_status(self.conn, session_id, "done")
         logger.info("Session %s stopped", session_id)

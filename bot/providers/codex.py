@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
+from bot.providers import _tracking
+from bot.providers._env import build_subprocess_env
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
 from bot.providers.claude import (
     _find_wsl_exe,
@@ -21,8 +23,6 @@ from bot.providers.claude import (
 )
 
 logger = logging.getLogger(__name__)
-
-_ENV = None  # inherit current environment
 
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSIONS_DIR = CODEX_DIR / "sessions"
@@ -88,7 +88,8 @@ class CodexProvider(CLIProvider):
         if session_id:
             args.extend(["resume", session_id])
         args.append(prompt)
-        args.extend(["--yolo", "--json"])
+        args.extend(self.config.codex_flags)
+        args.append("--json")
         return args
 
     def _build_command(self, prompt: str, session_id: str | None = None) -> str:
@@ -97,7 +98,8 @@ class CodexProvider(CLIProvider):
         if session_id:
             parts.extend(["resume", session_id])
         parts.append(json.dumps(prompt))
-        parts.extend(["--yolo", "--json"])
+        parts.extend(self.config.codex_flags)
+        parts.append("--json")
         return " ".join(parts)
 
     async def run(
@@ -122,17 +124,14 @@ class CodexProvider(CLIProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir,
-                env=_ENV,
+                env=build_subprocess_env(),
             )
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                if timeout_seconds > 0:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                else:
-                    stdout, stderr = await process.communicate()
+                stdout, stderr = await _tracking.communicate_tracked(
+                    process, timeout_seconds
+                )
             except TimeoutError:
                 logger.warning("Codex timed out after %ds", timeout_seconds)
                 await _kill_process(process)
@@ -187,12 +186,13 @@ class CodexProvider(CLIProvider):
         """Run Codex CLI inside a WSL distribution."""
         codex_bin = _resolve_wsl_cli(wsl_distro, "codex")
 
-        parts = [codex_bin, "exec"]
+        import shlex
+        parts = [shlex.quote(codex_bin), "exec"]
         if session_id:
-            parts.extend(["resume", session_id])
-        escaped_prompt = prompt.replace("'", "'\\''")
-        parts.append(f"'{escaped_prompt}'")
-        parts.extend(["--yolo", "--json"])
+            parts.extend(["resume", shlex.quote(session_id)])
+        parts.append(shlex.quote(prompt))
+        parts.extend(shlex.quote(flag) for flag in self.config.codex_flags)
+        parts.append("--json")
         inner_cmd = " ".join(parts)
 
         wsl = _find_wsl_exe()
@@ -210,16 +210,14 @@ class CodexProvider(CLIProvider):
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=build_subprocess_env(),
             )
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                if timeout_seconds > 0:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout_seconds
-                    )
-                else:
-                    stdout, stderr = await process.communicate()
+                stdout, stderr = await _tracking.communicate_tracked(
+                    process, timeout_seconds
+                )
             except TimeoutError:
                 logger.warning("Codex (WSL) timed out after %ds", timeout_seconds)
                 await _kill_process(process)
