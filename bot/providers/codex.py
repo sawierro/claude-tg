@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -10,9 +9,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
-from bot.providers import _tracking
 from bot.providers._env import build_subprocess_env
-from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
+from bot.providers.base import (
+    CLIProvider,
+    ProviderResponse,
+    ProviderSession,
+    is_process_alive,
+    run_subprocess,
+)
 from bot.providers.claude import (
     _find_wsl_exe,
     _get_wsl_distros,
@@ -115,66 +119,16 @@ class CodexProvider(CLIProvider):
 
         args = self._build_args(prompt, session_id)
         logger.info("Running codex (cwd=%s, resume=%s)", work_dir, bool(session_id))
-        start_time = time.monotonic()
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=work_dir,
-                env=build_subprocess_env(),
-            )
-
-            timeout_seconds = self.config.subprocess_timeout_minutes * 60
-            try:
-                stdout, stderr = await _tracking.communicate_tracked(
-                    process, timeout_seconds
-                )
-            except TimeoutError:
-                logger.warning("Codex timed out after %ds", timeout_seconds)
-                await _kill_process(process)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text="",
-                    cost=None,
-                    duration_seconds=time.monotonic() - start_time,
-                    error=f"Timeout after {self.config.subprocess_timeout_minutes} minutes",
-                )
-
-            duration = time.monotonic() - start_time
-            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
-            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
-
-            if process.returncode != 0 and not raw_stdout:
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text=raw_stderr or raw_stdout,
-                    cost=None,
-                    duration_seconds=duration,
-                    error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
-                )
-
-            return self._parse_response(raw_stdout, session_id, duration)
-
-        except FileNotFoundError:
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=f"Codex CLI not found at '{self._codex_path}'",
-            )
-        except Exception as e:
-            logger.exception("Unexpected error running Codex")
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=str(e),
-            )
+        return await run_subprocess(
+            args,
+            cwd=work_dir,
+            env=build_subprocess_env(),
+            timeout_seconds=self.config.subprocess_timeout_minutes * 60,
+            parse=self._parse_response,
+            display_name="Codex",
+            session_id=session_id,
+            not_found_message=f"Codex CLI not found at '{self._codex_path}'",
+        )
 
     async def _run_wsl(
         self,
@@ -195,72 +149,23 @@ class CodexProvider(CLIProvider):
         parts.append("--json")
         inner_cmd = " ".join(parts)
 
-        wsl = _find_wsl_exe()
         args = [
-            wsl, "-d", wsl_distro,
+            _find_wsl_exe(), "-d", wsl_distro,
             "--cd", work_dir,
             "--", "bash", "-l", "-c", inner_cmd,
         ]
-        logger.info("Running codex WSL [%s] (cwd=%s, resume=%s)", wsl_distro, work_dir, bool(session_id))
-        start_time = time.monotonic()
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(),
-            )
-
-            timeout_seconds = self.config.subprocess_timeout_minutes * 60
-            try:
-                stdout, stderr = await _tracking.communicate_tracked(
-                    process, timeout_seconds
-                )
-            except TimeoutError:
-                logger.warning("Codex (WSL) timed out after %ds", timeout_seconds)
-                await _kill_process(process)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text="",
-                    cost=None,
-                    duration_seconds=time.monotonic() - start_time,
-                    error=f"Timeout after {self.config.subprocess_timeout_minutes} minutes",
-                )
-
-            duration = time.monotonic() - start_time
-            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
-            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
-
-            if process.returncode != 0 and not raw_stdout:
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text=raw_stderr or raw_stdout,
-                    cost=None,
-                    duration_seconds=duration,
-                    error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
-                )
-
-            return self._parse_response(raw_stdout, session_id, duration)
-
-        except FileNotFoundError:
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error="wsl.exe not found — is WSL installed?",
-            )
-        except Exception as e:
-            logger.exception("Unexpected error running Codex in WSL")
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=str(e),
-            )
+        logger.info("Running codex WSL [%s] (cwd=%s, resume=%s)",
+                    wsl_distro, work_dir, bool(session_id))
+        return await run_subprocess(
+            args,
+            cwd=None,
+            env=build_subprocess_env(),
+            timeout_seconds=self.config.subprocess_timeout_minutes * 60,
+            parse=self._parse_response,
+            display_name="Codex(WSL)",
+            session_id=session_id,
+            not_found_message="wsl.exe not found — is WSL installed?",
+        )
 
     def _parse_response(
         self, raw: str, fallback_sid: str | None, duration: float
@@ -683,6 +588,3 @@ class CodexProvider(CLIProvider):
                 return text.strip()
 
         return None
-
-
-_kill_process = kill_process  # backward compat

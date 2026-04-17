@@ -1,20 +1,26 @@
-import asyncio
-import functools
 import json
 import logging
-import os
-import platform
-import re
-import shutil as _shutil
-import subprocess as _subprocess
-import time
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
-from bot.providers import _tracking
 from bot.providers._env import build_subprocess_env
-from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
+from bot.providers._shim import resolve_cli_exec, resolve_npm_shim
+from bot.providers._wsl import (
+    find_wsl_exe,
+    get_wsl_distros,
+    get_wsl_home,
+    resolve_wsl_cli,
+    wsl_path_to_windows,
+)
+from bot.providers.base import (
+    CLIProvider,
+    ProviderResponse,
+    ProviderSession,
+    is_process_alive,
+    run_subprocess,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,157 +28,15 @@ CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
-
-def _resolve_npm_shim(cmd_path: str) -> list[str] | None:
-    """If cmd_path is an npm-style .cmd shim on Windows, return [node, js_path].
-
-    Windows .cmd wrappers invoke node via cmd.exe, which truncates arguments
-    at embedded newlines when parsing `%1`/`%*`. Resolving the shim to a
-    direct `node cli.js` invocation bypasses cmd.exe and preserves multi-line
-    prompts.
-    """
-    if platform.system() != "Windows":
-        return None
-    resolved_str = _shutil.which(cmd_path) or cmd_path
-    resolved = Path(resolved_str)
-    if not resolved.exists() or resolved.suffix.lower() != ".cmd":
-        return None
-    try:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    # Typical npm shim tail:
-    #   "%_prog%"  "%dp0%\path\to\cli.js" %*
-    m = re.search(
-        r'"(%_prog%|[^"]*?node\.exe)"\s+"([^"]+\.js)"',
-        content,
-        re.IGNORECASE,
-    )
-    if not m:
-        return None
-    dp0 = str(resolved.parent) + "\\"
-    node_spec = m.group(1).replace("%dp0%", dp0)
-    js_path = os.path.normpath(m.group(2).replace("%dp0%", dp0))
-    if node_spec == "%_prog%":
-        candidate = resolved.parent / "node.exe"
-        node_exe = str(candidate) if candidate.exists() else "node"
-    else:
-        node_exe = os.path.normpath(node_spec)
-    return [node_exe, js_path]
-
-
-@functools.lru_cache(maxsize=8)
-def _resolve_cli_exec(cli_path: str) -> tuple[str, ...]:
-    """Return argv prefix for a CLI. On Windows, bypass .cmd npm shims."""
-    shim = _resolve_npm_shim(cli_path)
-    if shim:
-        logger.info("Resolved npm shim %s -> %s", cli_path, shim)
-        return tuple(shim)
-    return (cli_path,)
-
-# ---------------------------------------------------------------------------
-# WSL helpers (Windows only)
-# ---------------------------------------------------------------------------
-
-_wsl_unc_prefix_cache: dict[str, str] = {}
-
-
-def _find_wsl_exe() -> str:
-    """Find wsl.exe reliably — shutil.which, then System32 fallbacks."""
-    import shutil as _shutil
-    found = _shutil.which("wsl")
-    if found:
-        return found
-    # Fallback: common Windows paths (PATH may be incomplete)
-    for candidate in (
-        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wsl.exe",
-        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Sysnative" / "wsl.exe",
-    ):
-        if candidate.exists():
-            return str(candidate)
-    return "wsl"  # hope for the best
-
-
-def _resolve_wsl_cli(distro: str, cli_name: str) -> str:
-    """Find a CLI tool inside WSL — handles nvm/npm-installed binaries."""
-    try:
-        result = _subprocess.run(
-            [_find_wsl_exe(), "-d", distro, "--", "bash", "-lc", f"command -v {cli_name}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        path = result.stdout.strip()
-        if result.returncode == 0 and path:
-            return path
-    except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
-        pass
-    return cli_name
-
-
-def _get_wsl_distros() -> list[str]:
-    """Return installed WSL distribution names."""
-    if platform.system() != "Windows":
-        return []
-    wsl = _find_wsl_exe()
-    try:
-        result = _subprocess.run(
-            [wsl, "-l", "-q"],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return []
-        # wsl.exe outputs UTF-16LE on Windows
-        try:
-            text = result.stdout.decode("utf-16-le")
-        except UnicodeDecodeError:
-            text = result.stdout.decode("utf-8", errors="replace")
-        distros = [
-            line.strip().strip("\x00")
-            for line in text.strip().split("\n")
-            if line.strip().strip("\x00")
-        ]
-        return distros
-    except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
-        return []
-
-
-@functools.lru_cache(maxsize=16)
-def _get_wsl_home(distro: str) -> str | None:
-    """Return the default user's home directory inside a WSL distro."""
-    try:
-        result = _subprocess.run(
-            [_find_wsl_exe(), "-d", distro, "--", "printenv", "HOME"],
-            capture_output=True, text=True, timeout=10,
-        )
-        home = result.stdout.strip()
-        if result.returncode == 0 and home:
-            return home
-    except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
-        pass
-    return None
-
-
-def _wsl_path_to_windows(distro: str, linux_path: str) -> Path:
-    """Convert a Linux path inside WSL to a Windows-accessible UNC path."""
-    rel = linux_path.lstrip("/")
-
-    if distro in _wsl_unc_prefix_cache:
-        return Path(_wsl_unc_prefix_cache[distro]) / rel
-
-    for prefix in (f"\\\\wsl.localhost\\{distro}", f"\\\\wsl$\\{distro}"):
-        try:
-            if Path(prefix).exists():
-                _wsl_unc_prefix_cache[distro] = prefix
-                return Path(prefix) / rel
-        except OSError:
-            continue
-
-    fallback = f"\\\\wsl.localhost\\{distro}"
-    _wsl_unc_prefix_cache[distro] = fallback
-    return Path(fallback) / rel
-
-
-_is_process_alive = is_process_alive  # backward compat
+# Backwards-compat aliases — tests import these names, plus codex.py expects them.
+_find_wsl_exe = find_wsl_exe
+_resolve_wsl_cli = resolve_wsl_cli
+_get_wsl_distros = get_wsl_distros
+_get_wsl_home = get_wsl_home
+_wsl_path_to_windows = wsl_path_to_windows
+_resolve_npm_shim = resolve_npm_shim
+_resolve_cli_exec = resolve_cli_exec
+_is_process_alive = is_process_alive
 
 
 def _read_tail_lines(path: Path, n: int = 10) -> list[str]:
@@ -253,72 +117,16 @@ class ClaudeProvider(CLIProvider):
 
         args = self._build_args(prompt, session_id)
         logger.info("Running claude (cwd=%s, resume=%s)", work_dir, bool(session_id))
-        start_time = time.monotonic()
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=work_dir,
-                env=build_subprocess_env(),
-            )
-
-            timeout_seconds = self.config.subprocess_timeout_minutes * 60
-            try:
-                stdout, stderr = await _tracking.communicate_tracked(
-                    process, timeout_seconds
-                )
-            except TimeoutError:
-                logger.warning("Claude timed out after %ds", timeout_seconds)
-                await _kill_process(process)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text="",
-                    cost=None,
-                    duration_seconds=time.monotonic() - start_time,
-                    error=f"Timeout after {self.config.subprocess_timeout_minutes} minutes",
-                )
-
-            duration = time.monotonic() - start_time
-            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
-            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
-
-            if raw_stdout:
-                parsed = self._parse_response(raw_stdout, session_id, duration)
-                if parsed.session_id or parsed.text or parsed.error:
-                    return parsed
-
-            if process.returncode != 0:
-                logger.error("Claude exited %d: %s", process.returncode, raw_stderr)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text=raw_stderr or raw_stdout,
-                    cost=None,
-                    duration_seconds=duration,
-                    error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
-                )
-
-            return self._parse_response(raw_stdout, session_id, duration)
-
-        except FileNotFoundError:
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=f"Claude CLI not found at '{self.config.claude_path}'",
-            )
-        except Exception as e:
-            logger.exception("Unexpected error running Claude")
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=str(e),
-            )
+        return await run_subprocess(
+            args,
+            cwd=work_dir,
+            env=build_subprocess_env(),
+            timeout_seconds=self.config.subprocess_timeout_minutes * 60,
+            parse=self._parse_response,
+            display_name="Claude",
+            session_id=session_id,
+            not_found_message=f"Claude CLI not found at '{self.config.claude_path}'",
+        )
 
     async def _run_wsl(
         self,
@@ -328,11 +136,8 @@ class ClaudeProvider(CLIProvider):
         wsl_distro: str,
     ) -> ProviderResponse:
         """Run Claude Code CLI inside a WSL distribution."""
-        # Resolve actual claude path inside WSL (handles nvm/npm installs)
-        claude_bin = _resolve_wsl_cli(wsl_distro, "claude")
+        claude_bin = resolve_wsl_cli(wsl_distro, "claude")
 
-        # Build inner command for Linux shell — quote every argument with shlex
-        import shlex
         parts = [shlex.quote(claude_bin)]
         if session_id:
             parts.extend(["--resume", shlex.quote(session_id)])
@@ -341,79 +146,23 @@ class ClaudeProvider(CLIProvider):
         parts.extend(["--output-format", "json"])
         inner_cmd = " ".join(parts)
 
-        # Use create_subprocess_exec to avoid Windows cmd.exe quoting issues
-        wsl = _find_wsl_exe()
         args = [
-            wsl, "-d", wsl_distro,
+            find_wsl_exe(), "-d", wsl_distro,
             "--cd", work_dir,
             "--", "bash", "-l", "-c", inner_cmd,
         ]
-        logger.info("Running claude WSL [%s] (cwd=%s, resume=%s)", wsl_distro, work_dir, bool(session_id))
-        start_time = time.monotonic()
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=build_subprocess_env(),
-            )
-
-            timeout_seconds = self.config.subprocess_timeout_minutes * 60
-            try:
-                stdout, stderr = await _tracking.communicate_tracked(
-                    process, timeout_seconds
-                )
-            except TimeoutError:
-                logger.warning("Claude (WSL) timed out after %ds", timeout_seconds)
-                await _kill_process(process)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text="",
-                    cost=None,
-                    duration_seconds=time.monotonic() - start_time,
-                    error=f"Timeout after {self.config.subprocess_timeout_minutes} minutes",
-                )
-
-            duration = time.monotonic() - start_time
-            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
-            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
-
-            if raw_stdout:
-                parsed = self._parse_response(raw_stdout, session_id, duration)
-                if parsed.session_id or parsed.text or parsed.error:
-                    return parsed
-
-            if process.returncode != 0:
-                logger.error("Claude (WSL) exited %d: %s", process.returncode, raw_stderr)
-                return ProviderResponse(
-                    session_id=session_id or "",
-                    text=raw_stderr or raw_stdout,
-                    cost=None,
-                    duration_seconds=duration,
-                    error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
-                )
-
-            return self._parse_response(raw_stdout, session_id, duration)
-
-        except FileNotFoundError:
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error="wsl.exe not found — is WSL installed?",
-            )
-        except Exception as e:
-            logger.exception("Unexpected error running Claude in WSL")
-            return ProviderResponse(
-                session_id=session_id or "",
-                text="",
-                cost=None,
-                duration_seconds=time.monotonic() - start_time,
-                error=str(e),
-            )
+        logger.info("Running claude WSL [%s] (cwd=%s, resume=%s)",
+                    wsl_distro, work_dir, bool(session_id))
+        return await run_subprocess(
+            args,
+            cwd=None,
+            env=build_subprocess_env(),
+            timeout_seconds=self.config.subprocess_timeout_minutes * 60,
+            parse=self._parse_response,
+            display_name="Claude(WSL)",
+            session_id=session_id,
+            not_found_message="wsl.exe not found — is WSL installed?",
+        )
 
     def _parse_response(
         self, raw: str, fallback_sid: str | None, duration: float
@@ -638,6 +387,3 @@ class ClaudeProvider(CLIProvider):
         content = msg.get("content", [])
         text_parts = [c["text"] for c in content if c.get("type") == "text"]
         return "".join(text_parts).strip() if text_parts else None
-
-
-_kill_process = kill_process  # backward compat
