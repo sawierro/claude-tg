@@ -709,10 +709,10 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     timeout_s = config.subprocess_timeout_minutes * 60
 
     if status == "running":
-        if elapsed > timeout_s:
+        if timeout_s > 0 and elapsed > timeout_s:
             emoji = "\U0001f534"  # red
             health = f"вероятно зависла \\(> {config.subprocess_timeout_minutes} мин\\)"
-        elif elapsed > timeout_s / 2:
+        elif timeout_s > 0 and elapsed > timeout_s / 2:
             emoji = "\U0001f7e1"  # yellow
             health = f"работает долго \\({_format_elapsed(elapsed)}\\)"
         else:

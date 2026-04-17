@@ -123,9 +123,12 @@ class CodexProvider(CLIProvider):
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout_seconds
-                )
+                if timeout_seconds > 0:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_seconds
+                    )
+                else:
+                    stdout, stderr = await process.communicate()
             except asyncio.TimeoutError:
                 logger.warning("Codex timed out after %ds", timeout_seconds)
                 await _kill_process(process)
@@ -207,9 +210,12 @@ class CodexProvider(CLIProvider):
 
             timeout_seconds = self.config.subprocess_timeout_minutes * 60
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout_seconds
-                )
+                if timeout_seconds > 0:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout_seconds
+                    )
+                else:
+                    stdout, stderr = await process.communicate()
             except asyncio.TimeoutError:
                 logger.warning("Codex (WSL) timed out after %ds", timeout_seconds)
                 await _kill_process(process)

@@ -62,7 +62,7 @@ def test_config_defaults():
     config = Config(telegram_token="t")
     assert config.max_message_length == 4000
     assert config.session_timeout_hours == 24
-    assert config.subprocess_timeout_minutes == 30
+    assert config.subprocess_timeout_minutes == 0
     assert config.claude_flags == []
 
 

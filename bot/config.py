@@ -21,7 +21,7 @@ class Config:
     claude_flags: list[str] = field(default_factory=list)
     max_message_length: int = 4000
     session_timeout_hours: int = 24
-    subprocess_timeout_minutes: int = 30
+    subprocess_timeout_minutes: int = 0  # 0 = no timeout
     prompts_dir: str = "prompts"
     auto_continue_prompt: str = "Продолжи с того места, где остановился."
 
@@ -72,7 +72,7 @@ def load_config(path: str | None = None) -> Config:
         claude_flags=data.get("claude_flags", []),
         max_message_length=data.get("max_message_length", 4000),
         session_timeout_hours=data.get("session_timeout_hours", 24),
-        subprocess_timeout_minutes=data.get("subprocess_timeout_minutes", 30),
+        subprocess_timeout_minutes=data.get("subprocess_timeout_minutes", 0),
         prompts_dir=data.get("prompts_dir", "prompts"),
         auto_continue_prompt=data.get(
             "auto_continue_prompt",

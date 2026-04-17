@@ -184,7 +184,7 @@ TELEGRAM_TOKEN=123456:ABC-...
     "claude_path": "claude",
     "max_message_length": 4000,
     "session_timeout_hours": 24,
-    "subprocess_timeout_minutes": 30,
+    "subprocess_timeout_minutes": 0,
     "prompts_dir": "prompts",
     "auto_continue_prompt": "Продолжи с того места, где остановился."
 }
