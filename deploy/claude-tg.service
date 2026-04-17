@@ -1,0 +1,27 @@
+[Unit]
+Description=Claude-TG Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User= and WorkingDirectory= to match your install
+User=bot
+WorkingDirectory=/opt/claude-tg
+EnvironmentFile=/opt/claude-tg/.env
+ExecStart=/opt/claude-tg/.venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=5s
+# Give the bot time to kill in-flight claude/codex children on shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Claude keeps its own state in the user's $HOME; if the bot user doesn't own
+# any sensitive files there, you can tighten to ProtectHome=true.
+
+[Install]
+WantedBy=multi-user.target

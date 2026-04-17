@@ -1,7 +1,9 @@
 from bot.claude_runner import ClaudeResponse
 from bot.message_formatter import (
+    classify_error,
     escape_markdown_v2,
     format_error,
+    format_error_with_hint,
     format_notification,
     format_session_list,
     split_message,
@@ -90,3 +92,48 @@ def test_format_error():
     result = format_error("test error")
     assert "Ошибка" in result
     assert "test error" in result or "test\\ error" in result
+
+
+def test_classify_error_auth():
+    cat, hint = classify_error("Error: Not logged in")
+    assert cat == "auth"
+    assert hint is not None
+
+
+def test_classify_error_limit():
+    cat, hint = classify_error("Claude usage limit reached")
+    assert cat == "limit"
+    assert hint is not None
+
+
+def test_classify_error_timeout():
+    cat, hint = classify_error("Timeout after 30 minutes")
+    assert cat == "timeout"
+
+
+def test_classify_error_network():
+    cat, hint = classify_error("ECONNREFUSED 127.0.0.1:1234")
+    assert cat == "network"
+
+
+def test_classify_error_unknown():
+    cat, hint = classify_error("something truly weird and unique")
+    assert cat == "unknown"
+    assert hint is None
+
+
+def test_classify_error_empty_string():
+    cat, hint = classify_error("")
+    assert cat == "unknown"
+    assert hint is None
+
+
+def test_format_error_with_hint_includes_suggestion():
+    text = format_error_with_hint("Claude usage limit reached")
+    assert "Ошибка" in text
+    assert "💡" in text or "\U0001f4a1" in text  # lightbulb
+
+
+def test_format_error_with_hint_no_suggestion_for_unknown():
+    text = format_error_with_hint("some random error xyz")
+    assert "💡" not in text and "\U0001f4a1" not in text

@@ -1,0 +1,17 @@
+services:
+  claude-tg:
+    build: .
+    image: claude-tg:latest
+    container_name: claude-tg
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - claude_tg_data:/home/bot/claude-tg/data
+      # Optional: mount project directories you want Claude to work on
+      # - ./my-project:/home/bot/claude-tg/projects/my-project:rw
+
+volumes:
+  claude_tg_data:

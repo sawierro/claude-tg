@@ -226,6 +226,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/share <session> <id>` / `/unshare <session> <id>` \\— доступ к сессии\n\n"
 
         "*🛠 Диагностика*\n"
+        "`/botstatus` \\— аптайм, активные процессы, сводка\n"
         "`/debug` \\— состояние провайдеров, WSL\\-дистрибутивов, путей\n"
         "`/update` \\— проверить обновления бота"
     )
@@ -1331,13 +1332,55 @@ async def _resume_and_reply(
     )
 
     chunks = split_message(notification, config.max_message_length)
-    last_msg = None
     chat_id = update.effective_chat.id
 
+    # If the response is very long, send the full text as an attachment plus
+    # a short header — beats stitching together 10+ message chunks.
+    if not response.error and response.text and len(response.text) > 12000:
+        await _send_response_as_document(context, chat_id, session, response)
+        return
+
+    last_msg = None
     for chunk in chunks:
         last_msg = await _safe_send(context.bot, chat_id, chunk)
 
     # Update session with last message ID (scoped by chat)
+    if last_msg:
+        await session_mgr.update_tg_message(
+            session["id"], last_msg.message_id, tg_chat_id=chat_id,
+        )
+
+
+async def _send_response_as_document(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    session: dict,
+    response,
+) -> None:
+    """Send an over-12k-char Claude response as a file attachment with a short header."""
+    from io import BytesIO
+
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    preview = response.text[:500]
+    header = (
+        f"\U0001f4e6 *Длинный ответ от* `{escape_markdown_v2(session['name'])}` "
+        f"\\({len(response.text)} символов\\) отправлен файлом\\.\n\n"
+        f"*Превью:*\n{escape_markdown_v2(preview)}\\.\\.\\."
+    )
+    last_msg = await _safe_send(context.bot, chat_id, header)
+    buf = BytesIO(response.text.encode("utf-8"))
+    buf.name = f"{session['name']}-response.md"
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=buf,
+            filename=buf.name,
+        )
+    except Exception:
+        logger.exception("Failed to send long response as document")
+        # Fall back to chunked send
+        for chunk in split_message(response.text, 4000):
+            last_msg = await _safe_send(context.bot, chat_id, chunk)
     if last_msg:
         await session_mgr.update_tg_message(
             session["id"], last_msg.message_id, tg_chat_id=chat_id,
@@ -1940,6 +1983,41 @@ async def cmd_viewers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _safe_reply(update.message, "\n".join(lines))
 
 
+_BOT_START_TIME = datetime.now(UTC)
+
+
+@authorized
+async def cmd_botstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /botstatus — health check: uptime, active processes, session counts."""
+    from bot import db as db_module
+    from bot.providers import _tracking
+
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+    conn = session_mgr.conn
+
+    uptime_s = (datetime.now(UTC) - _BOT_START_TIME).total_seconds()
+    active_procs = _tracking.active_count()
+    sessions = await db_module.get_all_sessions(conn)
+    by_status: dict[str, int] = {}
+    for s in sessions:
+        by_status[s["status"]] = by_status.get(s["status"], 0) + 1
+    pending = await db_module.list_pending_prompts(conn)
+    owners = ", ".join(str(x) for x in context.bot_data["config"].allowed_chat_ids)
+
+    lines = [
+        "*Bot status*",
+        "Версия: *0\\.2\\.0*",
+        f"Uptime: {_format_elapsed(uptime_s)}",
+        f"Активных CLI\\-процессов: {active_procs}",
+        f"Сессий в БД: {len(sessions)} " + ", ".join(
+            f"{escape_markdown_v2(k)}\\={v}" for k, v in sorted(by_status.items())
+        ),
+        f"Отложенных промптов: {len(pending)}",
+        f"Owners: `{escape_markdown_v2(owners)}`",
+    ]
+    await _safe_reply(update.message, "\n".join(lines))
+
+
 @authorized
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /debug — show provider diagnostics."""
@@ -2088,6 +2166,7 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("unshare", cmd_unshare))
     app.add_handler(CommandHandler("viewers", cmd_viewers))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("botstatus", cmd_botstatus))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("ping", cmd_ping))

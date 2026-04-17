@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -14,11 +15,30 @@ from bot.resume_worker import resume_worker
 from bot.session_manager import SessionManager
 from bot.telegram_handler import setup_handlers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+def _configure_logging() -> None:
+    """Configure logging. Honour LOG_LEVEL env var; optional file handler."""
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+
+    log_file = os.environ.get("LOG_FILE")
+    if log_file:
+        from logging.handlers import RotatingFileHandler
+        # 10 MB per file × 5 backups = 50 MB ceiling
+        handlers.append(RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5))
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 

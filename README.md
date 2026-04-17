@@ -254,6 +254,39 @@ bot/
     └── codex.py         # OpenAI Codex CLI integration
 ```
 
+## Deployment
+
+### Docker
+
+```bash
+cp .env.example .env     # edit TELEGRAM_TOKEN + OWNER_CHAT_ID
+docker compose up -d --build
+docker logs -f claude-tg
+```
+
+The compose file mounts a `claude_tg_data` volume for the SQLite DB and prompts. Mount additional project directories as needed via the commented `volumes:` block. Note that Docker deployments can't talk to host `claude`/`codex` sessions running on Windows/WSL — the container has its own CLIs installed globally via npm.
+
+### systemd (Linux host install)
+
+```bash
+# clone + install deps into /opt/claude-tg
+sudo cp deploy/claude-tg.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-tg
+journalctl -u claude-tg -f
+```
+
+The unit file under `deploy/claude-tg.service` ships with `Restart=on-failure`, `PrivateTmp=true`, `ProtectSystem=full`, and a 30-second SIGTERM grace period so in-flight `claude`/`codex` subprocesses get a chance to exit cleanly.
+
+### Logging
+
+- `LOG_LEVEL=DEBUG|INFO|WARNING|ERROR` — sets the level for all loggers.
+- `LOG_FILE=/var/log/claude-tg.log` — optional; enables a rotating file handler (10 MB × 5 backups).
+
+### Health check
+
+`/botstatus` in Telegram reports version, uptime, number of active CLI subprocesses, session counts by status, and pending-prompt queue size — useful for remote health monitoring.
+
 ## Limitations
 
 - Telegram commands and terminal are separate context branches — use `/sync` to bridge them

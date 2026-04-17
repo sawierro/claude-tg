@@ -106,6 +106,9 @@ def format_notification(
 
     if response.error:
         body = f"\n\U0001f534 *Ошибка:*\n{escape_markdown_v2(response.error)}"
+        _, hint = classify_error(response.error)
+        if hint:
+            body += f"\n\n\U0001f4a1 {escape_markdown_v2(hint)}"
     else:
         body = (
             f"\n\u2500\u2500\u2500 Результат \u2500\u2500\u2500\n"
@@ -137,3 +140,70 @@ def format_session_list(sessions: list[dict]) -> str:
 def format_error(error: str) -> str:
     """Format an error message for Telegram."""
     return f"\U0001f534 *Ошибка:* {escape_markdown_v2(error)}"
+
+
+# ---------------------------------------------------------------------------
+# Error classification — turn opaque provider errors into actionable hints.
+# ---------------------------------------------------------------------------
+
+_ERROR_RULES: list[tuple[re.Pattern[str], str, str]] = [
+    (
+        re.compile(r"not logged in|api key|authentication", re.IGNORECASE),
+        "auth",
+        "CLI не авторизован. Откройте терминал и выполните `claude` (или `codex`) чтобы войти.",
+    ),
+    (
+        re.compile(r"rate limit|usage limit|too many requests|quota exceeded", re.IGNORECASE),
+        "limit",
+        "Достигнут лимит провайдера. Бот поставит сообщение в очередь автоматически — смотрите /pending.",
+    ),
+    (
+        re.compile(r"timeout|timed out", re.IGNORECASE),
+        "timeout",
+        "Таймаут CLI. Увеличьте `subprocess_timeout_minutes` в config.json или разбейте задачу.",
+    ),
+    (
+        re.compile(r"not found|no such file|cannot access", re.IGNORECASE),
+        "filesystem",
+        "Файл или каталог не найден. Проверьте путь и права доступа.",
+    ),
+    (
+        re.compile(r"network|connection|ECONNREFUSED|getaddrinfo", re.IGNORECASE),
+        "network",
+        "Проблема с сетью. Проверьте интернет и попробуйте снова.",
+    ),
+    (
+        re.compile(r"permission denied|EACCES", re.IGNORECASE),
+        "permission",
+        "Нет прав доступа. Проверьте, что бот запущен под правильным пользователем.",
+    ),
+    (
+        re.compile(r"JSONDecodeError|unexpected token|invalid json", re.IGNORECASE),
+        "parse",
+        "CLI вернул неожиданный формат. Возможна несовместимая версия claude/codex — обновите CLI.",
+    ),
+]
+
+
+def classify_error(error: str) -> tuple[str, str | None]:
+    """Return (category, suggested_action) for a raw provider error string.
+
+    Category is one of: auth, limit, timeout, filesystem, network, permission,
+    parse, unknown. The action is a short user-facing hint, or None if no rule
+    matched.
+    """
+    if not error:
+        return "unknown", None
+    for pattern, category, hint in _ERROR_RULES:
+        if pattern.search(error):
+            return category, hint
+    return "unknown", None
+
+
+def format_error_with_hint(error: str) -> str:
+    """Format an error plus a classified hint when possible."""
+    category, hint = classify_error(error)
+    base = f"\U0001f534 *Ошибка:* {escape_markdown_v2(error)}"
+    if hint:
+        return base + f"\n\n\U0001f4a1 {escape_markdown_v2(hint)}"
+    return base

@@ -74,12 +74,78 @@ Security hardening release aligned with `claude_tg_quality_criteria.md`.
 - Removed dead `SessionManager._running_tasks` field. `/cancel` is now
   honest about what it does (kill in-flight subprocesses).
 
+### Refactor
+
+- Extracted `bot/providers/_wsl.py` (WSL helpers) and
+  `bot/providers/_shim.py` (npm `.cmd` resolver) so providers no longer
+  reach into each other's private API. Codex drops the `from claude
+  import _private_*` chain.
+- Centralised subprocess spawning in `bot/providers/base.run_subprocess`
+  (template-method pattern). Removed ~200 lines of duplication between
+  Claude and Codex native/WSL paths.
+- Dropped dead `_running_tasks` dict from `SessionManager` and the
+  unused `_kill_process = kill_process` compat alias from providers.
+
+### UX
+
+- `/start` shows inline shortcuts (Connect / Sessions / Prompts / Usage /
+  Full help).
+- `/help` reorganised by scenario (Start / Work / Files / Templates /
+  Status / Access / Diagnostics).
+- Denied users get a single explicit "access denied" reply instead of
+  silent ignore.
+- Long responses (> 12 000 chars) are sent as a `.md` attachment with a
+  preview header instead of a 10-message wall.
+- Provider errors are classified (`auth`, `limit`, `timeout`,
+  `filesystem`, `network`, `permission`, `parse`) and the notification
+  includes a 💡 hint with a suggested action.
+- New `/botstatus` command: uptime, active CLI subprocess count,
+  per-status session breakdown, pending-prompt queue size — basic
+  health check.
+
+### Ops
+
+- `Dockerfile` + `docker-compose.yml` (Python 3.12 + Node 20 + npm
+  Claude/Codex CLIs, non-root bot user, tini as PID 1, persistent
+  volume for DB + prompts).
+- `deploy/claude-tg.service` systemd unit with hardening flags
+  (`PrivateTmp`, `ProtectSystem=full`, `KillSignal=SIGTERM`,
+  `TimeoutStopSec=30s` for clean subprocess shutdown).
+- `LOG_LEVEL` / `LOG_FILE` env vars: the latter enables a
+  `RotatingFileHandler` (10 MB × 5 backups).
+- `.dockerignore` prevents local DBs / secrets / caches leaking into
+  the build context.
+
 ### Documentation
 
 - New `SECURITY.md` documenting threat model, owner/viewer roles, secret
   handling, rate limiting, and known residual risks.
-- `README.md` updated to mention security section and drop the
-  auto-registration claim.
+- New `CHANGELOG.md` (this file).
+- `README.md` updated: security section pointing at SECURITY.md,
+  Deployment section with Docker + systemd + logging + health check,
+  Architecture tree refreshed with all new modules.
+- `README.txt` reduced to a concise pointer with a prominent security
+  callout — no longer drifts from `README.md`.
+- `docs/superpowers/specs/2026-04-16-auto-continue-design.md` kept
+  as an example of the design-first flow.
+
+### Testing
+
+- `tests/test_rate_limiter.py`, `tests/test_providers_env.py`,
+  `tests/test_path_traversal.py`, `tests/test_resume_worker.py`,
+  `tests/test_updater.py`, plus expanded `tests/test_db.py` and
+  `tests/test_message_formatter.py`.
+- `.github/workflows/ci.yml`: pytest + ruff + coverage on push/PR
+  (Ubuntu + Windows × Python 3.11/3.12).
+- Coverage raised from **19.3% → 30.3%**. 125 tests pass.
+
+### Known follow-ups (not blocking 0.2.0)
+
+- Handler split (criterion 4.1): `bot/telegram_handler.py` is still a
+  2000-line file. Needs handler-level tests first to refactor safely.
+- Coverage to the 70% target: blocked on the handler split.
+- `/update` origin-URL allowlist (criterion 11 from the review): the
+  bot currently trusts whatever `origin` is configured.
 
 ## [0.1.0] — initial release
 
