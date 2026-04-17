@@ -1,7 +1,7 @@
 """Thin wrapper — preserves old imports. Real logic in providers/claude.py."""
-from bot.providers.claude import ClaudeProvider
-from bot.providers.base import ProviderSession
 from bot.config import Config
+from bot.providers.base import ProviderSession
+from bot.providers.claude import ClaudeProvider
 
 # Backwards-compatible alias
 ExternalSession = ProviderSession

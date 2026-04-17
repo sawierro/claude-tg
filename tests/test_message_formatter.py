@@ -1,12 +1,11 @@
-import pytest
+from bot.claude_runner import ClaudeResponse
 from bot.message_formatter import (
     escape_markdown_v2,
-    split_message,
+    format_error,
     format_notification,
     format_session_list,
-    format_error,
+    split_message,
 )
-from bot.claude_runner import ClaudeResponse
 
 
 def test_escape_special_chars():

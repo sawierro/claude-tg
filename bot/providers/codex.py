@@ -2,19 +2,22 @@ import asyncio
 import json
 import logging
 import os
-import platform
 import shutil
 import sqlite3
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
 from bot.providers.claude import (
-    _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows,
-    _find_wsl_exe, _resolve_wsl_cli, _resolve_cli_exec,
+    _find_wsl_exe,
+    _get_wsl_distros,
+    _get_wsl_home,
+    _resolve_cli_exec,
+    _resolve_wsl_cli,
+    _wsl_path_to_windows,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,7 +133,7 @@ class CodexProvider(CLIProvider):
                     )
                 else:
                     stdout, stderr = await process.communicate()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Codex timed out after %ds", timeout_seconds)
                 await _kill_process(process)
                 return ProviderResponse(
@@ -217,7 +220,7 @@ class CodexProvider(CLIProvider):
                     )
                 else:
                     stdout, stderr = await process.communicate()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Codex (WSL) timed out after %ds", timeout_seconds)
                 await _kill_process(process)
                 return ProviderResponse(
@@ -384,7 +387,7 @@ class CodexProvider(CLIProvider):
                 if not sid:
                     continue
 
-                started_at = datetime.now(tz=timezone.utc)
+                started_at = datetime.now(tz=UTC)
                 if created:
                     try:
                         started_at = datetime.fromisoformat(str(created))
@@ -524,8 +527,8 @@ class CodexProvider(CLIProvider):
 
                 # Timestamps are Unix epoch seconds
                 started_at = datetime.fromtimestamp(
-                    created_ts, tz=timezone.utc
-                ) if created_ts else datetime.now(tz=timezone.utc)
+                    created_ts, tz=UTC
+                ) if created_ts else datetime.now(tz=UTC)
 
                 # Consider "alive" if updated in the last 10 minutes
                 alive = (now_ts - updated_ts) < 600 if updated_ts else False
@@ -610,7 +613,7 @@ class CodexProvider(CLIProvider):
                 pid=0,
                 cwd="",
                 started_at=datetime.fromtimestamp(
-                    zst_file.stat().st_mtime, tz=timezone.utc
+                    zst_file.stat().st_mtime, tz=UTC
                 ),
                 is_alive=False,
                 slug=sid[:8],

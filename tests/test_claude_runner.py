@@ -1,7 +1,9 @@
 import json
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from bot.claude_runner import run_claude, _parse_response, _build_command, ClaudeResponse
+
+from bot.claude_runner import _build_command, _parse_response, run_claude
 from bot.config import Config
 
 

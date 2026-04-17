@@ -1,6 +1,6 @@
 import json
-import os
 import logging
+import os
 import platform
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +51,7 @@ def load_config(path: str | None = None) -> Config:
     data = {}
 
     if Path(config_path).exists():
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             data = json.load(f)
         logger.info("Config loaded from %s", config_path)
     else:

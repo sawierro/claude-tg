@@ -5,10 +5,10 @@ from pathlib import Path
 
 import aiosqlite
 
+from bot import db
 from bot.config import Config
 from bot.providers.base import CLIProvider, ProviderResponse
 from bot.session_watcher import SessionWatcher
-from bot import db
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +279,7 @@ class SessionManager:
                     lines.append(msg["content"])
                     lines.append("")
             else:
-                lines.append(f"**Result:**")
+                lines.append("**Result:**")
                 lines.append("")
                 lines.append(msg["content"])
                 lines.append("")

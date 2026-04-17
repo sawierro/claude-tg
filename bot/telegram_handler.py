@@ -1,34 +1,31 @@
-import json
-import logging
 import functools
+import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-from bot.config import Config
-from bot.session_manager import SessionManager
-from bot.message_formatter import (
-    format_notification,
-    format_session_list,
-    format_error,
-    escape_markdown_v2,
-    split_message,
-)
-from bot.external_sessions import list_external_sessions, find_session_by_query
+from bot import limit_detector
 from bot import prompts as prompts_module
 from bot import updater as updater_module
-from bot import limit_detector
+from bot.config import Config
+from bot.message_formatter import (
+    escape_markdown_v2,
+    format_error,
+    format_notification,
+    split_message,
+)
+from bot.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -689,9 +686,9 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     updated_iso = session["updated_at"]
     try:
         updated = datetime.fromisoformat(updated_iso.replace(" ", "T")).replace(
-            tzinfo=timezone.utc
+            tzinfo=UTC
         )
-        elapsed = (datetime.now(timezone.utc) - updated).total_seconds()
+        elapsed = (datetime.now(UTC) - updated).total_seconds()
     except (ValueError, AttributeError):
         elapsed = 0
 
@@ -700,9 +697,9 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if last_msg_iso:
         try:
             lm = datetime.fromisoformat(last_msg_iso.replace(" ", "T")).replace(
-                tzinfo=timezone.utc
+                tzinfo=UTC
             )
-            last_msg_ago = (datetime.now(timezone.utc) - lm).total_seconds()
+            last_msg_ago = (datetime.now(UTC) - lm).total_seconds()
         except (ValueError, AttributeError):
             pass
 
@@ -943,7 +940,6 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route text messages to the appropriate session."""
     session_mgr: SessionManager = context.bot_data["session_mgr"]
-    config: Config = context.bot_data["config"]
     text = update.message.text
 
     if not text:
@@ -1294,7 +1290,7 @@ async def _offer_pending_resume(
         session_mgr.conn, session["id"], chat_id, prompt, retry_at_iso, "auto",
     )
 
-    wait_seconds = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+    wait_seconds = max(0, (retry_at - datetime.now(UTC)).total_seconds())
     wait_str = _format_elapsed(wait_seconds)
     name_esc = escape_markdown_v2(session["name"])
 
@@ -1713,7 +1709,6 @@ async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /share <session_name> <chat_id> — grant watcher access."""
     from bot import db as db_module
-    session_mgr: SessionManager = context.bot_data["session_mgr"]
     conn = context.bot_data["db_conn"]
 
     if len(context.args) < 2:
@@ -1850,7 +1845,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Detailed diagnostics if provider supports it
         if hasattr(provider, "diagnose"):
             lines.append("")
-            lines.append(f"  *Детали:*")
+            lines.append("  *Детали:*")
             try:
                 for diag_line in provider.diagnose():
                     lines.append(f"  `{escape_markdown_v2(diag_line)}`")

@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 
 from bot.config import Config
-from bot.providers.base import ProviderResponse
 
 
 # Backwards-compatible alias

@@ -1,19 +1,19 @@
+import aiosqlite
 import pytest
 import pytest_asyncio
-import aiosqlite
+
 from bot.db import (
-    init_db,
     create_session,
-    update_session_status,
+    delete_session,
+    get_active_sessions,
+    get_last_message_time,
     get_session,
     get_session_by_name,
     get_session_by_tg_message,
-    get_active_sessions,
-    delete_session,
-    insert_message,
-    cleanup_stale_sessions,
     get_token_usage,
-    get_last_message_time,
+    init_db,
+    insert_message,
+    update_session_status,
 )
 
 

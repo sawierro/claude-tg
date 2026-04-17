@@ -93,7 +93,7 @@ class SessionWatcher:
                     continue
 
                 try:
-                    with open(jsonl_path, "r", encoding="utf-8") as f:
+                    with open(jsonl_path, encoding="utf-8") as f:
                         f.seek(file_pos)
                         new_data = f.read()
                         file_pos = f.tell()

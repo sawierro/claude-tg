@@ -1,8 +1,8 @@
 import json
-import os
+
 import pytest
-from pathlib import Path
-from bot.config import load_config, Config
+
+from bot.config import Config, load_config
 
 
 @pytest.fixture(autouse=True)

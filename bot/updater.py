@@ -18,10 +18,10 @@ async def _run_git(*args: str, timeout: int = 30) -> tuple[int, str, str]:
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError as e:
         process.kill()
         await process.wait()
-        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s")
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s") from e
     return (
         process.returncode,
         stdout.decode("utf-8", errors="replace").strip(),

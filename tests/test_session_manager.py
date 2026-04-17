@@ -1,10 +1,12 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock
+
 from bot.config import Config
 from bot.db import init_db
-from bot.session_manager import SessionManager
 from bot.providers.base import ProviderResponse
+from bot.session_manager import SessionManager
 
 
 @pytest.fixture

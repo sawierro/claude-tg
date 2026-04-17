@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def parse_reset_time(text: str | None, now: datetime | None = None) -> datetime:
     if no pattern matches.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
     if not text:
         return now + timedelta(hours=DEFAULT_RESET_HOURS)

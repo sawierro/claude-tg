@@ -56,7 +56,7 @@ async def kill_process(process: asyncio.subprocess.Process) -> None:
         process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             await process.wait()
     except ProcessLookupError:

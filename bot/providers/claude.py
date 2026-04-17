@@ -8,7 +8,7 @@ import re
 import shutil as _shutil
 import subprocess as _subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from bot.config import Config
@@ -275,7 +275,7 @@ class ClaudeProvider(CLIProvider):
                     )
                 else:
                     stdout, stderr = await process.communicate()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Claude timed out after %ds", timeout_seconds)
                 await _kill_process(process)
                 return ProviderResponse(
@@ -374,7 +374,7 @@ class ClaudeProvider(CLIProvider):
                     )
                 else:
                     stdout, stderr = await process.communicate()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Claude (WSL) timed out after %ds", timeout_seconds)
                 await _kill_process(process)
                 return ProviderResponse(
@@ -487,8 +487,8 @@ class ClaudeProvider(CLIProvider):
                     continue
 
                 started_at = datetime.fromtimestamp(
-                    started_ms / 1000, tz=timezone.utc
-                ) if started_ms else datetime.now(tz=timezone.utc)
+                    started_ms / 1000, tz=UTC
+                ) if started_ms else datetime.now(tz=UTC)
 
                 alive = _is_process_alive(pid) if pid else False
                 slug = _get_session_slug(session_id)
@@ -534,8 +534,8 @@ class ClaudeProvider(CLIProvider):
                         continue
 
                     started_at = datetime.fromtimestamp(
-                        started_ms / 1000, tz=timezone.utc
-                    ) if started_ms else datetime.now(tz=timezone.utc)
+                        started_ms / 1000, tz=UTC
+                    ) if started_ms else datetime.now(tz=UTC)
 
                     # Check process via /proc (may not work for all setups)
                     alive = True

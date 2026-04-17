@@ -6,8 +6,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application
 
 from bot import db as db_module
+from bot.message_formatter import escape_markdown_v2
 from bot.session_manager import SessionManager
-from bot.message_formatter import escape_markdown_v2, split_message
 
 logger = logging.getLogger(__name__)
 

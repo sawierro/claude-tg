@@ -1,18 +1,16 @@
 import asyncio
 import logging
-import sys
 import signal
+import sys
 
 from telegram.ext import Application
 
-import os
-
 from bot.config import load_config
-from bot.db import init_db, cleanup_stale_sessions, reset_running_sessions
-from bot.session_manager import SessionManager
-from bot.telegram_handler import setup_handlers
+from bot.db import cleanup_stale_sessions, init_db, reset_running_sessions
 from bot.providers.claude import ClaudeProvider
 from bot.resume_worker import resume_worker
+from bot.session_manager import SessionManager
+from bot.telegram_handler import setup_handlers
 
 logging.basicConfig(
     level=logging.INFO,

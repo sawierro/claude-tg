@@ -1,10 +1,8 @@
 import platform
-import sys
 
 import pytest
 
 from bot.providers.claude import _resolve_npm_shim
-
 
 NPM_SHIM_TEMPLATE = """@ECHO off
 GOTO start
