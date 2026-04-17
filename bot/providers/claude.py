@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import platform
+import re
+import shutil as _shutil
 import subprocess as _subprocess
 import time
 from datetime import datetime, timezone
@@ -19,6 +21,55 @@ _ENV = None  # inherit current environment (not a frozen copy)
 CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+
+def _resolve_npm_shim(cmd_path: str) -> list[str] | None:
+    """If cmd_path is an npm-style .cmd shim on Windows, return [node, js_path].
+
+    Windows .cmd wrappers invoke node via cmd.exe, which truncates arguments
+    at embedded newlines when parsing `%1`/`%*`. Resolving the shim to a
+    direct `node cli.js` invocation bypasses cmd.exe and preserves multi-line
+    prompts.
+    """
+    if platform.system() != "Windows":
+        return None
+    resolved_str = _shutil.which(cmd_path) or cmd_path
+    resolved = Path(resolved_str)
+    if not resolved.exists() or resolved.suffix.lower() != ".cmd":
+        return None
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    # Typical npm shim tail:
+    #   "%_prog%"  "%dp0%\path\to\cli.js" %*
+    m = re.search(
+        r'"(%_prog%|[^"]*?node\.exe)"\s+"([^"]+\.js)"',
+        content,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    dp0 = str(resolved.parent) + "\\"
+    node_spec = m.group(1).replace("%dp0%", dp0)
+    js_path = os.path.normpath(m.group(2).replace("%dp0%", dp0))
+    if node_spec == "%_prog%":
+        candidate = resolved.parent / "node.exe"
+        node_exe = str(candidate) if candidate.exists() else "node"
+    else:
+        node_exe = os.path.normpath(node_spec)
+    return [node_exe, js_path]
+
+
+@functools.lru_cache(maxsize=8)
+def _resolve_cli_exec(cli_path: str) -> tuple[str, ...]:
+    """Return argv prefix for a CLI. On Windows, bypass .cmd npm shims."""
+    shim = _resolve_npm_shim(cli_path)
+    if shim:
+        logger.info("Resolved npm shim %s -> %s", cli_path, shim)
+        return tuple(shim)
+    return (cli_path,)
 
 # ---------------------------------------------------------------------------
 # WSL helpers (Windows only)
@@ -171,7 +222,7 @@ class ClaudeProvider(CLIProvider):
 
     def _build_args(self, prompt: str, session_id: str | None = None) -> list[str]:
         """Build argument list for Claude CLI (no shell interpretation)."""
-        args = [self.config.claude_path]
+        args = list(_resolve_cli_exec(self.config.claude_path))
         if session_id:
             args.extend(["--resume", session_id])
         args.extend(["-p", prompt])

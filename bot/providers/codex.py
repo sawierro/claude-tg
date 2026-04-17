@@ -14,7 +14,7 @@ from bot.config import Config
 from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession, is_process_alive, kill_process
 from bot.providers.claude import (
     _get_wsl_distros, _get_wsl_home, _wsl_path_to_windows,
-    _find_wsl_exe, _resolve_wsl_cli,
+    _find_wsl_exe, _resolve_wsl_cli, _resolve_cli_exec,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,8 @@ class CodexProvider(CLIProvider):
 
     def _build_args(self, prompt: str, session_id: str | None = None) -> list[str]:
         """Build argument list for Codex CLI (no shell interpretation)."""
-        args = [self._codex_path, "exec"]
+        args = list(_resolve_cli_exec(self._codex_path))
+        args.append("exec")
         if session_id:
             args.extend(["resume", session_id])
         args.append(prompt)
