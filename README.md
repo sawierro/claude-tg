@@ -74,7 +74,18 @@ chmod +x setup.sh
 
 The setup script creates a virtual environment, installs dependencies, and prompts for your bot token.
 
-### 3. First Launch
+### 3. Set Your Owner Chat ID
+
+The bot requires an explicit owner — **it does not auto-register the first caller any more** (security: anyone who saw your bot username could hijack it). Find your Telegram chat ID by messaging [@userinfobot](https://t.me/userinfobot), then add it to `.env`:
+
+```
+TELEGRAM_TOKEN=123456:ABC-...
+OWNER_CHAT_ID=123456789
+```
+
+Multiple owners: comma-separate them (`OWNER_CHAT_ID=111,222`).
+
+### 4. First Launch
 
 ```bash
 # Windows
@@ -84,7 +95,9 @@ start.bat
 ./start.sh
 ```
 
-On first launch, send `/start` to your bot in Telegram. It auto-registers your `chat_id` — only you can control the bot after this.
+Send `/help` to your bot in Telegram to see the command list.
+
+> ⚠️ **Read [`SECURITY.md`](SECURITY.md) before exposing the bot to anyone else.** The CLI runs with `--dangerously-skip-permissions` by default, which means bot access is equivalent to SSH access on the host.
 
 ## Usage
 
@@ -174,23 +187,41 @@ Sessions with auto-continue enabled show a 🔁 icon in `/sessions`. When the wa
 **`.env`** — secrets (created during setup):
 ```
 TELEGRAM_TOKEN=123456:ABC-...
+OWNER_CHAT_ID=123456789
 ```
+
+Owner can be a comma-separated list. The bot refuses to start without at least one owner. The token lives only in `.env`; if it appears in `config.json` it's ignored with a warning.
 
 **`config.json`** — settings (auto-created from `config.example.json`):
 ```json
 {
     "allowed_chat_ids": [],
     "default_work_dir": ".",
-    "claude_path": "claude",
+    "claude_path": "claude.cmd",
+    "claude_flags": ["--dangerously-skip-permissions"],
+    "codex_path": "codex.cmd",
+    "codex_flags": ["--yolo"],
     "max_message_length": 4000,
     "session_timeout_hours": 24,
-    "subprocess_timeout_minutes": 0,
+    "subprocess_timeout_minutes": 30,
     "prompts_dir": "prompts",
-    "auto_continue_prompt": "Продолжи с того места, где остановился."
+    "auto_continue_prompt": "Продолжи с того места, где остановился.",
+    "rate_limit_per_minute": 30,
+    "concurrent_sessions": 3
 }
 ```
 
-`allowed_chat_ids` is populated automatically on first `/start`. `prompts_dir` is where prompt templates are stored (relative to the project root by default).
+`allowed_chat_ids` in `config.json` is used when `OWNER_CHAT_ID` env isn't set. `prompts_dir` stores prompt templates (relative to project root). `claude_flags` / `codex_flags` are forwarded verbatim to the CLIs — remove `--dangerously-skip-permissions` if you want Claude to prompt for permission on each edit (breaks unattended use but safer). `rate_limit_per_minute` caps owner messages per minute.
+
+## Security
+
+Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
+
+- The bot runs Claude/Codex with full filesystem access under your user. **Bot access ≈ SSH access.**
+- Token only in `.env`. `config.json` is written 0600 on POSIX.
+- Subprocess environment is minimised — `TELEGRAM_TOKEN` and generic `*_TOKEN` / cloud credentials are stripped before launch.
+- File transfer paths are realpath-checked; sensitive names, suffixes (`.pem .key .gpg ...`), and directories (`.git .ssh .aws ...`) blocked.
+- Per-chat rate limiter, central subprocess tracker, and graceful shutdown kill any in-flight Claude/Codex processes.
 
 ## Requirements
 
@@ -203,18 +234,22 @@ TELEGRAM_TOKEN=123456:ABC-...
 ```
 bot/
 ├── main.py              # Entry point, polling loop, graceful shutdown
-├── config.py            # Config loading (.env + config.json)
-├── db.py                # SQLite (aiosqlite): sessions, messages, viewers, pending_prompts
+├── config.py            # Config loading (.env + config.json), validation
+├── db.py                # SQLite (aiosqlite): schema_version migrations, tx helper, WAL checkpoint
 ├── telegram_handler.py  # All Telegram commands and message routing
 ├── session_manager.py   # Session lifecycle, watcher management
-├── session_watcher.py   # JSONL file watcher for terminal responses
+├── session_watcher.py   # JSONL file watcher for terminal responses (auto-restart on crash)
 ├── message_formatter.py # MarkdownV2 escaping, message splitting
 ├── prompts.py           # Prompt template storage (list/save/read/delete)
 ├── updater.py           # Self-update via git fetch/pull
 ├── limit_detector.py    # Rate/usage limit detection + reset-time parsing
 ├── resume_worker.py     # Background worker for queued prompts
+├── maintenance.py       # Hourly WAL checkpoint
+├── rate_limiter.py      # Per-chat rate limiter + concurrency guard
 └── providers/
     ├── base.py          # Abstract CLI provider interface
+    ├── _env.py          # Minimal subprocess environment (strips secrets)
+    ├── _tracking.py     # Active subprocess registry for shutdown / /cancel
     ├── claude.py        # Claude Code CLI integration
     └── codex.py         # OpenAI Codex CLI integration
 ```

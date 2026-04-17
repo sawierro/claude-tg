@@ -187,16 +187,20 @@ class SessionManager:
         """List all active sessions."""
         return await db.get_active_sessions(self.conn)
 
-    async def get_session_by_tg_message(self, message_id: int) -> dict | None:
-        """Find session by Telegram message ID."""
-        return await db.get_session_by_tg_message(self.conn, message_id)
+    async def get_session_by_tg_message(
+        self, message_id: int, chat_id: int | None = None
+    ) -> dict | None:
+        """Find session by Telegram message ID scoped by chat_id."""
+        return await db.get_session_by_tg_message(self.conn, message_id, chat_id)
 
     async def update_tg_message(
-        self, session_id: str, tg_message_id: int
+        self, session_id: str, tg_message_id: int, tg_chat_id: int | None = None
     ) -> None:
-        """Update the last Telegram message ID for reply routing."""
+        """Update the last Telegram message ID (and chat_id) for reply routing."""
         await db.update_session_status(
-            self.conn, session_id, "waiting", last_tg_msg_id=tg_message_id
+            self.conn, session_id, "waiting",
+            last_tg_msg_id=tg_message_id,
+            last_tg_chat_id=tg_chat_id,
         )
 
     def _start_watcher(self, session_id: str, name: str, provider_name: str = "claude") -> None:

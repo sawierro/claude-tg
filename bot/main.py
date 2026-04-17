@@ -7,6 +7,7 @@ from telegram.ext import Application
 
 from bot.config import load_config
 from bot.db import cleanup_stale_sessions, init_db, reset_running_sessions
+from bot.maintenance import maintenance_worker
 from bot.providers import _tracking
 from bot.providers.claude import ClaudeProvider
 from bot.resume_worker import resume_worker
@@ -80,8 +81,9 @@ def main() -> None:
             await app.start()
             await app.updater.start_polling()
 
-            # Background: auto-resume worker
+            # Background: auto-resume worker + DB maintenance (WAL checkpoint)
             worker_task = asyncio.create_task(resume_worker(app, session_mgr))
+            maintenance_task = asyncio.create_task(maintenance_worker(conn))
 
             logger.info("Bot is running. Press Ctrl+C to stop.")
 
@@ -111,11 +113,12 @@ def main() -> None:
                 pass
 
             logger.info("Shutting down...")
-            worker_task.cancel()
-            try:
-                await worker_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for bg in (worker_task, maintenance_task):
+                bg.cancel()
+                try:
+                    await bg
+                except (asyncio.CancelledError, Exception):
+                    pass
             killed = await _tracking.kill_all()
             if killed:
                 logger.info("Killed %d in-flight CLI subprocess(es) on shutdown", killed)

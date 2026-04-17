@@ -1,9 +1,13 @@
 import asyncio
+import logging
 import os
 import platform
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -98,3 +102,85 @@ class CLIProvider(ABC):
     def extract_end_turn_text(self, line: str) -> str | None:
         """Parse a JSONL line. Return text if it's a completed assistant response."""
         ...
+
+
+async def run_subprocess(
+    argv: list[str],
+    *,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    timeout_seconds: int,
+    parse: "callable",
+    display_name: str,
+    session_id: str | None,
+    not_found_message: str,
+) -> ProviderResponse:
+    """Shared subprocess runner used by Claude / Codex providers.
+
+    Centralises process spawning, timeout handling, tracking, and error
+    wrapping so each provider only supplies argv, cwd, and a parser.
+    """
+    from bot.providers import _tracking  # local to break import cycle
+
+    start_time = time.monotonic()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+
+        try:
+            stdout, stderr = await _tracking.communicate_tracked(process, timeout_seconds)
+        except TimeoutError:
+            logger.warning("%s timed out after %ds", display_name, timeout_seconds)
+            await kill_process(process)
+            return ProviderResponse(
+                session_id=session_id or "",
+                text="",
+                cost=None,
+                duration_seconds=time.monotonic() - start_time,
+                error=f"Timeout after {timeout_seconds // 60} minutes",
+            )
+
+        duration = time.monotonic() - start_time
+        raw_stdout = stdout.decode("utf-8", errors="replace").strip()
+        raw_stderr = stderr.decode("utf-8", errors="replace").strip()
+
+        if raw_stdout:
+            parsed = parse(raw_stdout, session_id, duration)
+            if parsed.session_id or parsed.text or parsed.error:
+                return parsed
+
+        if process.returncode != 0:
+            logger.error("%s exited %d: %s", display_name, process.returncode, raw_stderr)
+            return ProviderResponse(
+                session_id=session_id or "",
+                text=raw_stderr or raw_stdout,
+                cost=None,
+                duration_seconds=duration,
+                error=f"Exit code {process.returncode}: {(raw_stderr or raw_stdout)[:500]}",
+            )
+
+        return parse(raw_stdout, session_id, duration)
+
+    except FileNotFoundError:
+        return ProviderResponse(
+            session_id=session_id or "",
+            text="",
+            cost=None,
+            duration_seconds=time.monotonic() - start_time,
+            error=not_found_message,
+        )
+    except Exception as e:
+        logger.exception("Unexpected error running %s", display_name)
+        return ProviderResponse(
+            session_id=session_id or "",
+            text="",
+            cost=None,
+            duration_seconds=time.monotonic() - start_time,
+            error=str(e),
+        )

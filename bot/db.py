@@ -1,4 +1,6 @@
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -7,11 +9,13 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = str(Path(__file__).resolve().parent.parent / "claude_tg.db")
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY
-);
+# ---------------------------------------------------------------------------
+# Migrations — versioned, idempotent, tracked in schema_version table.
+# Add a new tuple to MIGRATIONS when changing the schema; NEVER edit an
+# applied migration in place.
+# ---------------------------------------------------------------------------
 
+MIGRATION_1_INITIAL = """
 CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -20,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     provider        TEXT NOT NULL DEFAULT 'claude',
     wsl_distro      TEXT NOT NULL DEFAULT '',
     last_tg_msg_id  INTEGER,
+    last_tg_chat_id INTEGER,
     auto_continue   INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -37,7 +42,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_tg_msg ON sessions(last_tg_msg_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_tg_route ON sessions(last_tg_chat_id, last_tg_msg_id);
 
 CREATE TABLE IF NOT EXISTS bot_users (
     chat_id     INTEGER PRIMARY KEY,
@@ -66,52 +71,118 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
 CREATE INDEX IF NOT EXISTS idx_pending_retry ON pending_prompts(retry_at);
 """
 
+# Columns added after initial release — kept as separate migrations so existing
+# databases upgrade cleanly. Each one is idempotent via a schema_version check.
+MIGRATION_2_LEGACY_COLUMNS = [
+    ("sessions", "provider", "TEXT NOT NULL DEFAULT 'claude'"),
+    ("sessions", "wsl_distro", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "auto_continue", "INTEGER NOT NULL DEFAULT 0"),
+    ("sessions", "last_tg_chat_id", "INTEGER"),
+    ("messages", "tokens_in", "INTEGER"),
+    ("messages", "tokens_out", "INTEGER"),
+]
+
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, "initial_schema"),
+    (2, "legacy_columns_backfill"),
+]
+
+
+async def _apply_migration(conn: aiosqlite.Connection, version: int) -> None:
+    """Apply a single migration by version number."""
+    if version == 1:
+        await conn.executescript(MIGRATION_1_INITIAL)
+    elif version == 2:
+        for table, col, decl in MIGRATION_2_LEGACY_COLUMNS:
+            try:
+                async with conn.execute(f"SELECT {col} FROM {table} LIMIT 1"):
+                    pass
+            except Exception:
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                logger.info("Migration 2: added %s.%s", table, col)
+    else:
+        raise ValueError(f"Unknown migration version: {version}")
+
+
+async def _current_version(conn: aiosqlite.Connection) -> int:
+    """Return the highest applied migration version, or 0 if none."""
+    async with conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version"
+    ) as cur:
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
 
 async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
-    """Initialize database, create tables, enable WAL mode."""
+    """Initialize database: WAL mode, versioned migrations, foreign keys."""
     conn = await aiosqlite.connect(db_path)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA foreign_keys=ON")
-    await conn.executescript(SCHEMA_SQL)
+    await conn.execute("PRAGMA synchronous=NORMAL")
+
+    # Always ensure schema_version exists (bootstrap)
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version ("
+        "version INTEGER PRIMARY KEY, "
+        "applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
     await conn.commit()
 
-    # Migration: add provider column if missing (upgrade from v1)
-    try:
-        await conn.execute("SELECT provider FROM sessions LIMIT 1")
-    except Exception:
-        await conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'")
-        await conn.commit()
-        logger.info("Migrated: added provider column to sessions")
+    # Backwards compat: if we see an old DB with tables but no version rows,
+    # stamp it as version 1 before layering further migrations on top.
+    if await _current_version(conn) == 0:
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ) as cur:
+            pre_existing = await cur.fetchone()
+        if pre_existing:
+            await conn.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(1)")
+            await conn.commit()
+            logger.info("Detected legacy schema — stamped as version 1")
 
-    # Migration: add wsl_distro column if missing
-    try:
-        await conn.execute("SELECT wsl_distro FROM sessions LIMIT 1")
-    except Exception:
-        await conn.execute("ALTER TABLE sessions ADD COLUMN wsl_distro TEXT NOT NULL DEFAULT ''")
-        await conn.commit()
-        logger.info("Migrated: added wsl_distro column to sessions")
+    applied = await _current_version(conn)
+    for version, name in MIGRATIONS:
+        if version > applied:
+            logger.info("Applying migration %d (%s)", version, name)
+            async with tx(conn):
+                await _apply_migration(conn, version)
+                await conn.execute(
+                    "INSERT INTO schema_version(version) VALUES(?)", (version,)
+                )
 
-    # Migration: add tokens_in/tokens_out columns if missing
-    try:
-        await conn.execute("SELECT tokens_in FROM messages LIMIT 1")
-    except Exception:
-        await conn.execute("ALTER TABLE messages ADD COLUMN tokens_in INTEGER")
-        await conn.execute("ALTER TABLE messages ADD COLUMN tokens_out INTEGER")
-        await conn.commit()
-        logger.info("Migrated: added tokens_in/tokens_out columns to messages")
-
-    # Migration: add auto_continue column if missing
-    try:
-        await conn.execute("SELECT auto_continue FROM sessions LIMIT 1")
-    except Exception:
-        await conn.execute("ALTER TABLE sessions ADD COLUMN auto_continue INTEGER NOT NULL DEFAULT 0")
-        await conn.commit()
-        logger.info("Migrated: added auto_continue column to sessions")
-
-    logger.info("Database initialized at %s", db_path)
+    logger.info("Database initialized at %s (schema v%d)", db_path, await _current_version(conn))
     return conn
 
+
+# ---------------------------------------------------------------------------
+# Transaction helper — batches multiple writes into one fsync.
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def tx(conn: aiosqlite.Connection) -> AsyncIterator[aiosqlite.Connection]:
+    """Async transaction context: wraps writes in BEGIN/COMMIT or ROLLBACK."""
+    await conn.execute("BEGIN")
+    try:
+        yield conn
+    except Exception:
+        await conn.execute("ROLLBACK")
+        raise
+    else:
+        await conn.execute("COMMIT")
+
+
+async def wal_checkpoint(conn: aiosqlite.Connection) -> None:
+    """Truncate the WAL file — call periodically to keep it from growing."""
+    try:
+        await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception as e:
+        logger.warning("wal_checkpoint failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
 
 async def create_session(
     conn: aiosqlite.Connection,
@@ -123,7 +194,8 @@ async def create_session(
 ) -> None:
     """Insert a new session."""
     await conn.execute(
-        "INSERT INTO sessions (id, name, work_dir, status, provider, wsl_distro) VALUES (?, ?, ?, 'running', ?, ?)",
+        "INSERT INTO sessions (id, name, work_dir, status, provider, wsl_distro) "
+        "VALUES (?, ?, ?, 'running', ?, ?)",
         (session_id, name, work_dir, provider, wsl_distro),
     )
     await conn.commit()
@@ -134,13 +206,22 @@ async def update_session_status(
     session_id: str,
     status: str,
     last_tg_msg_id: int | None = None,
+    last_tg_chat_id: int | None = None,
 ) -> None:
-    """Update session status and optionally the last telegram message id."""
+    """Update session status and optionally reply-routing fields."""
     if last_tg_msg_id is not None:
-        await conn.execute(
-            "UPDATE sessions SET status=?, last_tg_msg_id=?, updated_at=datetime('now') WHERE id=?",
-            (status, last_tg_msg_id, session_id),
-        )
+        if last_tg_chat_id is not None:
+            await conn.execute(
+                "UPDATE sessions SET status=?, last_tg_msg_id=?, last_tg_chat_id=?, "
+                "updated_at=datetime('now') WHERE id=?",
+                (status, last_tg_msg_id, last_tg_chat_id, session_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE sessions SET status=?, last_tg_msg_id=?, "
+                "updated_at=datetime('now') WHERE id=?",
+                (status, last_tg_msg_id, session_id),
+            )
     else:
         await conn.execute(
             "UPDATE sessions SET status=?, updated_at=datetime('now') WHERE id=?",
@@ -164,9 +245,23 @@ async def get_session_by_name(conn: aiosqlite.Connection, name: str) -> dict | N
 
 
 async def get_session_by_tg_message(
-    conn: aiosqlite.Connection, tg_message_id: int
+    conn: aiosqlite.Connection,
+    tg_message_id: int,
+    tg_chat_id: int | None = None,
 ) -> dict | None:
-    """Get session by the last Telegram message ID (for reply routing)."""
+    """Find session by Telegram message ID; scoped by chat_id when supplied.
+
+    Scoping by chat_id prevents cross-user collisions: Telegram message ids
+    are only unique per-chat, so a stale row for chat A could match a fresh
+    message in chat B without this filter.
+    """
+    if tg_chat_id is not None:
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE last_tg_msg_id=? AND last_tg_chat_id=?",
+            (tg_message_id, tg_chat_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
     async with conn.execute(
         "SELECT * FROM sessions WHERE last_tg_msg_id=?", (tg_message_id,)
     ) as cur:
@@ -198,6 +293,10 @@ async def delete_session(conn: aiosqlite.Connection, session_id: str) -> None:
     await conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
 async def insert_message(
     conn: aiosqlite.Connection,
     session_id: str,
@@ -209,7 +308,8 @@ async def insert_message(
 ) -> None:
     """Insert a message into the history."""
     await conn.execute(
-        "INSERT INTO messages (session_id, role, content, tg_message_id, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (session_id, role, content, tg_message_id, tokens_in, tokens_out) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (session_id, role, content, tg_message_id, tokens_in, tokens_out),
     )
     await conn.commit()
@@ -220,12 +320,7 @@ async def get_token_usage(
     session_id: str | None = None,
     since: str | None = None,
 ) -> tuple[int, int, int]:
-    """Return (sum_in, sum_out, message_count) for usage aggregation.
-
-    If session_id is None, aggregates across all sessions.
-    If since is None, aggregates all-time. Otherwise since is SQLite datetime string
-    (e.g. '-5 hours', '-24 hours').
-    """
+    """Return (sum_in, sum_out, message_count) for usage aggregation."""
     where = ["role='assistant'"]
     params: list = []
     if session_id is not None:
@@ -277,12 +372,14 @@ async def reset_running_sessions(conn: aiosqlite.Connection) -> int:
 async def cleanup_stale_sessions(
     conn: aiosqlite.Connection, timeout_hours: int
 ) -> int:
-    """Mark stale running/waiting sessions as error. Returns count of cleaned sessions."""
+    """Mark stale running/waiting sessions as error."""
+    # Use parameter substitution with explicit modifier — avoids string concat.
+    modifier = f"-{int(timeout_hours)} hours"
     cursor = await conn.execute(
-        """UPDATE sessions SET status='error', updated_at=datetime('now')
-           WHERE status IN ('running', 'waiting')
-           AND updated_at < datetime('now', ? || ' hours')""",
-        (f"-{timeout_hours}",),
+        "UPDATE sessions SET status='error', updated_at=datetime('now') "
+        "WHERE status IN ('running', 'waiting') "
+        "AND updated_at < datetime('now', ?)",
+        (modifier,),
     )
     await conn.commit()
     return cursor.rowcount
@@ -293,7 +390,6 @@ async def cleanup_stale_sessions(
 # ---------------------------------------------------------------------------
 
 async def get_bot_user(conn: aiosqlite.Connection, chat_id: int) -> dict | None:
-    """Get a bot user by chat_id."""
     async with conn.execute("SELECT * FROM bot_users WHERE chat_id=?", (chat_id,)) as cur:
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -306,7 +402,6 @@ async def create_bot_user(
     full_name: str,
     role: str = "pending",
 ) -> None:
-    """Create a new bot user (access request)."""
     await conn.execute(
         "INSERT OR IGNORE INTO bot_users (chat_id, username, full_name, role) VALUES (?, ?, ?, ?)",
         (chat_id, username, full_name, role),
@@ -317,7 +412,6 @@ async def create_bot_user(
 async def update_bot_user_role(
     conn: aiosqlite.Connection, chat_id: int, role: str
 ) -> bool:
-    """Update user role. Returns True if user existed."""
     cursor = await conn.execute(
         "UPDATE bot_users SET role=? WHERE chat_id=?", (role, chat_id)
     )
@@ -326,7 +420,6 @@ async def update_bot_user_role(
 
 
 async def get_pending_users(conn: aiosqlite.Connection) -> list[dict]:
-    """Get all users with pending access requests."""
     async with conn.execute(
         "SELECT * FROM bot_users WHERE role='pending' ORDER BY created_at ASC"
     ) as cur:
@@ -335,7 +428,6 @@ async def get_pending_users(conn: aiosqlite.Connection) -> list[dict]:
 
 
 async def get_viewers(conn: aiosqlite.Connection) -> list[dict]:
-    """Get all approved viewers."""
     async with conn.execute(
         "SELECT * FROM bot_users WHERE role='viewer' ORDER BY created_at ASC"
     ) as cur:
@@ -344,13 +436,12 @@ async def get_viewers(conn: aiosqlite.Connection) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# session_viewers — per-session read-only access
+# session_viewers
 # ---------------------------------------------------------------------------
 
 async def add_session_viewer(
     conn: aiosqlite.Connection, chat_id: int, session_id: str
 ) -> None:
-    """Grant read-only watcher access to a session."""
     await conn.execute(
         "INSERT OR IGNORE INTO session_viewers (chat_id, session_id) VALUES (?, ?)",
         (chat_id, session_id),
@@ -361,7 +452,6 @@ async def add_session_viewer(
 async def remove_session_viewer(
     conn: aiosqlite.Connection, chat_id: int, session_id: str
 ) -> None:
-    """Revoke watcher access to a session."""
     await conn.execute(
         "DELETE FROM session_viewers WHERE chat_id=? AND session_id=?",
         (chat_id, session_id),
@@ -372,7 +462,6 @@ async def remove_session_viewer(
 async def get_session_viewer_ids(
     conn: aiosqlite.Connection, session_id: str
 ) -> list[int]:
-    """Get chat_ids of all viewers for a session."""
     async with conn.execute(
         "SELECT chat_id FROM session_viewers WHERE session_id=?", (session_id,)
     ) as cur:
@@ -383,7 +472,6 @@ async def get_session_viewer_ids(
 async def get_viewer_session_ids(
     conn: aiosqlite.Connection, chat_id: int
 ) -> list[str]:
-    """Get session_ids a viewer has access to."""
     async with conn.execute(
         "SELECT session_id FROM session_viewers WHERE chat_id=?", (chat_id,)
     ) as cur:
@@ -392,7 +480,7 @@ async def get_viewer_session_ids(
 
 
 # ---------------------------------------------------------------------------
-# pending_prompts — queue for auto-resume after limit reset
+# pending_prompts
 # ---------------------------------------------------------------------------
 
 async def create_pending_prompt(
@@ -403,7 +491,6 @@ async def create_pending_prompt(
     retry_at: str,
     mode: str,
 ) -> int:
-    """Insert a pending prompt. retry_at is ISO datetime. Returns row id."""
     cursor = await conn.execute(
         "INSERT INTO pending_prompts (session_id, chat_id, prompt, retry_at, mode) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -416,7 +503,6 @@ async def create_pending_prompt(
 async def get_pending_prompt(
     conn: aiosqlite.Connection, pending_id: int
 ) -> dict | None:
-    """Get a pending prompt by id."""
     async with conn.execute(
         "SELECT * FROM pending_prompts WHERE id=?", (pending_id,)
     ) as cur:
@@ -425,7 +511,6 @@ async def get_pending_prompt(
 
 
 async def get_due_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
-    """Return pending prompts whose retry_at has passed."""
     async with conn.execute(
         "SELECT * FROM pending_prompts WHERE retry_at <= datetime('now') "
         "ORDER BY retry_at ASC"
@@ -437,13 +522,11 @@ async def get_due_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
 async def delete_pending_prompt(
     conn: aiosqlite.Connection, pending_id: int
 ) -> None:
-    """Delete a pending prompt entry."""
     await conn.execute("DELETE FROM pending_prompts WHERE id=?", (pending_id,))
     await conn.commit()
 
 
 async def list_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
-    """List all pending prompts ordered by retry_at."""
     async with conn.execute(
         "SELECT * FROM pending_prompts ORDER BY retry_at ASC"
     ) as cur:
@@ -454,7 +537,6 @@ async def list_pending_prompts(conn: aiosqlite.Connection) -> list[dict]:
 async def get_pending_by_session(
     conn: aiosqlite.Connection, session_id: str
 ) -> dict | None:
-    """Return the most recent pending prompt for a session, or None."""
     async with conn.execute(
         "SELECT * FROM pending_prompts WHERE session_id=? "
         "ORDER BY retry_at DESC LIMIT 1",
@@ -467,7 +549,6 @@ async def get_pending_by_session(
 async def set_auto_continue(
     conn: aiosqlite.Connection, session_id: str, enabled: bool
 ) -> bool:
-    """Toggle auto_continue for a session. Returns True if session existed."""
     cursor = await conn.execute(
         "UPDATE sessions SET auto_continue=? WHERE id=?",
         (1 if enabled else 0, session_id),

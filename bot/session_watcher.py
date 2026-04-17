@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 3
 MIN_NOTIFY_INTERVAL_SECONDS = 2  # debounce: max 1 notification per 2 seconds
 LIMIT_DEBOUNCE_SECONDS = 300     # 5 min between limit-detected callbacks
+RESTART_BACKOFF_SECONDS = 5      # initial delay before restarting a crashed watcher
+RESTART_MAX_BACKOFF_SECONDS = 60
+RESTART_MAX_ATTEMPTS = 10        # cap to stop infinite restart after repeated failures
 
 
 class SessionWatcher:
@@ -37,11 +40,37 @@ class SessionWatcher:
         self._last_limit_time: float = float("-inf")
 
     def start(self) -> None:
-        """Start watching in background."""
+        """Start watching in background with automatic restart on crashes."""
         if self._task and not self._task.done():
             return
-        self._task = asyncio.create_task(self._watch_loop())
+        self._task = asyncio.create_task(self._supervised_loop())
         logger.info("Watcher started for session %s (%s)", self.session_name, self.session_id[:8])
+
+    async def _supervised_loop(self) -> None:
+        """Supervise _watch_loop: restart with exponential backoff on crashes.
+
+        CancelledError is propagated so `stop()` remains effective.
+        A clean return from _watch_loop (e.g. history file not found yet)
+        also triggers a restart — the file may appear shortly.
+        """
+        attempts = 0
+        backoff = RESTART_BACKOFF_SECONDS
+        while attempts < RESTART_MAX_ATTEMPTS:
+            try:
+                await self._watch_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Watcher crashed for %s — restarting in %ds",
+                                 self.session_name, backoff)
+            attempts += 1
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, RESTART_MAX_BACKOFF_SECONDS)
+        logger.warning("Watcher for %s gave up after %d restart attempts",
+                       self.session_name, RESTART_MAX_ATTEMPTS)
 
     def stop(self) -> None:
         """Stop watching."""
@@ -141,6 +170,7 @@ class SessionWatcher:
                                 logger.exception("Limit callback failed")
 
         except asyncio.CancelledError:
-            pass
+            # Propagate so the supervisor can exit cleanly on stop()
+            raise
         except Exception:
             logger.exception("Watcher loop crashed for %s", self.session_name)

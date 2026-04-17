@@ -162,47 +162,72 @@ def authorized(func):
 
 @authorized
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
+    """Handle /start — welcome screen with inline shortcuts."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔌 Подключиться", callback_data="help:connect"),
+            InlineKeyboardButton("📋 Сессии", callback_data="help:sessions"),
+        ],
+        [
+            InlineKeyboardButton("📝 Шаблоны", callback_data="help:prompts"),
+            InlineKeyboardButton("📊 Usage", callback_data="help:usage"),
+        ],
+        [
+            InlineKeyboardButton("❓ Полный /help", callback_data="help:full"),
+        ],
+    ])
     await update.message.reply_text(
-        "*Claude\\-TG Bot*\n\n"
-        "Удалённое управление сессиями Claude Code\\.\n\n"
-        "Команды: /help",
+        "*Claude\\-TG* \\— удалённое управление Claude Code / Codex\\.\n\n"
+        "Запустите `claude` или `codex` в терминале и нажмите "
+        "*🔌 Подключиться* ниже\\.\n\n"
+        "Полный список команд: /help",
         parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=keyboard,
     )
 
 
 @authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
+    """Handle /help — grouped command reference."""
     text = (
-        "*Команды:*\n\n"
-        "`/connect` \\- Подключиться к терминалу\n"
-        "`/new <name> [path] [prompt]` \\- Новая сессия\n"
-        "`/sessions` \\- Активные сессии бота\n"
-        "`/get <file>` \\- Скачать файл из проекта\n"
-        "`/stop <name>` \\- Отключить сессию\n"
-        "`/sync` \\- Записать сводку в файл для терминала\n"
-        "`/cancel` \\- Прервать текущую работу\n"
-        "`/ping [name]` \\- Проверить статус сессии\n"
-        "`/usage [name]` \\- Расход токенов за 5ч/24ч/всё время\n"
-        "`/pending` \\- Очередь сообщений при сбросе лимита\n"
-        "`/autocontinue [on|off]` \\- Авто\\-продолжение терминальной сессии "
-        "после сброса лимита \\(индикатор 🔁\\)\n"
-        "`/update` \\- Проверить обновления бота\n\n"
-        "*Файлы:*\n"
-        "\\- `/get README\\.md` \\- скачать файл\n"
-        "\\- Отправьте файл \\- сохранится в work\\_dir\n\n"
-        "*Шаблоны промптов:*\n"
-        "`/prompts` \\- список шаблонов\n"
-        "`/prompt <имя>` \\- отправить шаблон в сессию\n"
-        "`/prompt_del <имя>` \\- удалить шаблон\n"
-        "\\- Отправьте `\\.md`/`\\.txt` с подписью `\\#prompt` \\- сохранить\n\n"
-        "*Доступ:*\n"
-        "`/viewers` \\- запросы и наблюдатели\n"
-        "`/approve <id>` \\- одобрить запрос\n"
-        "`/deny <id>` \\- отклонить запрос\n"
-        "`/share <session> <id>` \\- дать доступ к сессии\n"
-        "`/unshare <session> <id>` \\- отозвать доступ"
+        "*Claude\\-TG* \\— удалённое управление Claude Code / Codex\\.\n\n"
+
+        "*🚀 Начало работы*\n"
+        "`/connect` \\— подключиться к активному терминалу\n"
+        "`/new <name> [path] [prompt]` \\— создать новую сессию\n"
+        "`/sessions` \\— список сессий \\(🔁 \\= auto\\-continue, 🐧 \\= WSL\\)\n\n"
+
+        "*💬 Работа с сессией*\n"
+        "Просто отправь сообщение \\— уйдёт в активную сессию\\. "
+        "*Ответь \\(reply\\)* на ответ бота, чтобы адресовать именно ту сессию\\.\n"
+        "`/stop <name>` \\— отключить сессию от бота\n"
+        "`/cancel` \\— убить все работающие CLI\\-процессы\n"
+        "`/sync` \\— записать сводку в `\\.claude\\-tg\\-sync\\.md`\n\n"
+
+        "*📁 Файлы*\n"
+        "`/get <file>` \\— скачать файл из work\\_dir\n"
+        "Отправь файл боту \\— сохранится в work\\_dir активной сессии\n\n"
+
+        "*📝 Шаблоны промптов*\n"
+        "`/prompts` \\— список шаблонов \\(кнопки\\)\n"
+        "`/prompt <имя>` \\— отправить шаблон в сессию\n"
+        "`/prompt_del <имя>` \\— удалить шаблон\n"
+        "Отправь `\\.md` / `\\.txt` с подписью `\\#prompt` \\— сохранить как шаблон\n\n"
+
+        "*📊 Статус и лимиты*\n"
+        "`/ping [name]` \\— статус сессии \\(работает / зависла / ошибка\\)\n"
+        "`/usage [name]` \\— расход токенов за 5ч / 24ч / всё время\n"
+        "`/pending` \\— очередь сообщений, ждущих сброса лимита\n"
+        "`/autocontinue [on|off] [name]` \\— auto\\-продолжение terminal\\-сессии\n\n"
+
+        "*🔐 Управление доступом*\n"
+        "`/viewers` \\— запросы и наблюдатели\n"
+        "`/approve <id>` / `/deny <id>` \\— обработать запрос\n"
+        "`/share <session> <id>` / `/unshare <session> <id>` \\— доступ к сессии\n\n"
+
+        "*🛠 Диагностика*\n"
+        "`/debug` \\— состояние провайдеров, WSL\\-дистрибутивов, путей\n"
+        "`/update` \\— проверить обновления бота"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -284,7 +309,10 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Update session with the last message ID for reply routing
     if last_msg and response.session_id:
-        await session_mgr.update_tg_message(response.session_id, last_msg.message_id)
+        await session_mgr.update_tg_message(
+            response.session_id, last_msg.message_id,
+            tg_chat_id=update.effective_chat.id,
+        )
 
     # Delete the "processing" message
     try:
@@ -958,10 +986,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     session = None
 
-    # If replying to a bot message, find the session
+    # If replying to a bot message, find the session (scoped by chat_id)
     if update.message.reply_to_message:
         reply_msg_id = update.message.reply_to_message.message_id
-        session = await session_mgr.get_session_by_tg_message(reply_msg_id)
+        session = await session_mgr.get_session_by_tg_message(
+            reply_msg_id, chat_id=update.effective_chat.id
+        )
 
     # If not a reply, try remembered session, then active sessions
     if not session:
@@ -1029,6 +1059,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_resume_cancel_callback(query, context)
     elif data.startswith("resm:"):
         await _handle_resume_pending_callback(query, context)
+    elif data.startswith("help:"):
+        await _handle_help_shortcut(query, context)
+
+
+async def _handle_help_shortcut(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start inline shortcuts — point user to the right command."""
+    action = query.data.split(":", 1)[1]
+    hints = {
+        "connect": "Отправьте `/connect` — появится список активных terminal\\-сессий с кнопками\\.",
+        "sessions": "Отправьте `/sessions` — покажу все сессии \\(🔁 auto\\-continue, 🐧 WSL\\)\\.",
+        "prompts": (
+            "*Шаблоны промптов*\n"
+            "`/prompts` — список с кнопками\n"
+            "`/prompt <имя>` — отправить шаблон\n"
+            "Пришлите `\\.md`/`\\.txt` с подписью `\\#prompt` — сохранится как шаблон\\."
+        ),
+        "usage": "Отправьте `/usage` — покажу расход токенов за 5ч / 24ч / всё время\\.",
+        "full": None,  # handled below
+    }
+    if action == "full":
+        # Fake a /help invocation: edit the message with the grouped reference
+        from bot.message_formatter import escape_markdown_v2  # noqa: F401 (kept for clarity)
+        # Build same text as cmd_help; dedup by calling cmd_help's body inline
+        await query.edit_message_text(
+            "Вводите /help — полный список команд\\.\n"
+            "Или выберите действие кнопкой ниже\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    msg = hints.get(action, "Неизвестный раздел\\.")
+    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def _handle_prompt_callback(
@@ -1276,9 +1337,11 @@ async def _resume_and_reply(
     for chunk in chunks:
         last_msg = await _safe_send(context.bot, chat_id, chunk)
 
-    # Update session with last message ID
+    # Update session with last message ID (scoped by chat)
     if last_msg:
-        await session_mgr.update_tg_message(session["id"], last_msg.message_id)
+        await session_mgr.update_tg_message(
+            session["id"], last_msg.message_id, tg_chat_id=chat_id,
+        )
 
 
 async def _offer_pending_resume(

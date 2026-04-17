@@ -3,6 +3,7 @@ import pytest
 import pytest_asyncio
 
 from bot.db import (
+    _current_version,
     create_session,
     delete_session,
     get_active_sessions,
@@ -13,7 +14,9 @@ from bot.db import (
     get_token_usage,
     init_db,
     insert_message,
+    tx,
     update_session_status,
+    wal_checkpoint,
 )
 
 
@@ -168,3 +171,72 @@ async def test_get_pending_by_session(conn):
     assert row is not None
     assert row["id"] == pid
     assert row["mode"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_schema_version_tracked(conn):
+    """init_db must stamp schema_version table with at least one row."""
+    v = await _current_version(conn)
+    assert v >= 1
+
+
+@pytest.mark.asyncio
+async def test_init_db_idempotent(tmp_path):
+    """Running init_db twice on the same DB must not duplicate migrations."""
+    db_path = str(tmp_path / "mig.db")
+    c1 = await init_db(db_path)
+    v1 = await _current_version(c1)
+    await c1.close()
+    c2 = await init_db(db_path)
+    v2 = await _current_version(c2)
+    async with c2.execute("SELECT COUNT(*) FROM schema_version") as cur:
+        count = (await cur.fetchone())[0]
+    await c2.close()
+    assert v1 == v2
+    assert count == v2  # one row per migration, no duplicates
+
+
+@pytest.mark.asyncio
+async def test_tx_rolls_back_on_error(conn):
+    """A transaction helper must roll back raw SQL writes on exception."""
+    try:
+        async with tx(conn):
+            await conn.execute(
+                "INSERT INTO sessions(id,name,work_dir,status) "
+                "VALUES('rb','rollback','/tmp','waiting')"
+            )
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert await get_session(conn, "rb") is None
+
+
+@pytest.mark.asyncio
+async def test_tx_commits_on_success(conn):
+    """A transaction helper must commit when the block succeeds."""
+    async with tx(conn):
+        await conn.execute(
+            "INSERT INTO sessions(id,name,work_dir,status) "
+            "VALUES('ok','commit-ok','/tmp','waiting')"
+        )
+    assert await get_session(conn, "ok") is not None
+
+
+@pytest.mark.asyncio
+async def test_wal_checkpoint_runs(conn):
+    """wal_checkpoint must not raise on an open connection."""
+    await wal_checkpoint(conn)  # just verify no exception
+
+
+@pytest.mark.asyncio
+async def test_tg_message_routing_scoped_by_chat(conn):
+    """Two sessions sharing the same tg_message_id must be disambiguated by chat_id."""
+    await create_session(conn, "sa", "a", "/tmp")
+    await create_session(conn, "sb", "b", "/tmp")
+    await update_session_status(conn, "sa", "waiting", last_tg_msg_id=100, last_tg_chat_id=111)
+    await update_session_status(conn, "sb", "waiting", last_tg_msg_id=100, last_tg_chat_id=222)
+
+    s_a = await get_session_by_tg_message(conn, 100, tg_chat_id=111)
+    s_b = await get_session_by_tg_message(conn, 100, tg_chat_id=222)
+    assert s_a and s_a["id"] == "sa"
+    assert s_b and s_b["id"] == "sb"
