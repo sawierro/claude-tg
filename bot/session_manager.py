@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import uuid
+from collections import deque
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -11,6 +13,9 @@ from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession
 from bot.session_watcher import SessionWatcher
 
 logger = logging.getLogger(__name__)
+
+RECENT_LOG_SIZE = 3
+RECENT_LOG_TRUNCATE = 2000
 
 
 class SessionManager:
@@ -23,6 +28,9 @@ class SessionManager:
         self._watcher_callback = None
         self._limit_callback = None
         self._providers: dict[str, CLIProvider] = {}
+        # In-memory rolling log of the last few assistant messages observed by
+        # the watcher for each session. Bounded by RECENT_LOG_SIZE per session.
+        self._recent_messages: dict[str, deque[tuple[datetime, str, str]]] = {}
 
     def register_provider(self, provider: CLIProvider) -> None:
         """Register a CLI provider (claude, codex, etc.)."""
@@ -64,6 +72,28 @@ class SessionManager:
     def set_watcher_callback(self, callback) -> None:
         """Set callback for watcher notifications: async fn(session_id, name, text)."""
         self._watcher_callback = callback
+
+    def record_watcher_message(
+        self, session_id: str, session_name: str, text: str
+    ) -> None:
+        """Append a watcher-detected assistant message to the rolling log."""
+        buf = self._recent_messages.get(session_id)
+        if buf is None:
+            buf = deque(maxlen=RECENT_LOG_SIZE)
+            self._recent_messages[session_id] = buf
+        snippet = text if len(text) <= RECENT_LOG_TRUNCATE else text[:RECENT_LOG_TRUNCATE] + "…"
+        buf.append((datetime.now(UTC), session_name, snippet))
+
+    def get_recent_messages(
+        self, session_id: str
+    ) -> list[tuple[datetime, str, str]]:
+        """Return the rolling watcher log for one session (oldest first)."""
+        buf = self._recent_messages.get(session_id)
+        return list(buf) if buf else []
+
+    def all_recent_messages(self) -> dict[str, list[tuple[datetime, str, str]]]:
+        """Return the rolling watcher log for every session."""
+        return {sid: list(buf) for sid, buf in self._recent_messages.items()}
 
     def set_limit_callback(self, callback) -> None:
         """Set callback invoked when watcher detects a limit error: async fn(session_id, raw_line)."""

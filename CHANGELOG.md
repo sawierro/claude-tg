@@ -4,9 +4,23 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-04-18 (unreleased)
+
+### Added
+
+- `/lastlog [name]` — shows the last 3 messages the watcher has observed
+  for each session (or for the named session). Entries live in-memory
+  per session (3 × up to 2 000 chars) and reset on bot restart.
+
+### Performance
+
+- `/sessions` and `/connect` are noticeably faster: `get_wsl_distros()`
+  now has a 60s TTL cache, and provider scans run off the event loop
+  via `asyncio.to_thread` + `gather`.
+
 ## [0.2.0] — 2026-04-18 (unreleased)
 
-Security hardening release aligned with `claude_tg_quality_criteria.md`.
+Security hardening release.
 
 ### Security
 
@@ -126,8 +140,6 @@ Security hardening release aligned with `claude_tg_quality_criteria.md`.
   Architecture tree refreshed with all new modules.
 - `README.txt` reduced to a concise pointer with a prominent security
   callout — no longer drifts from `README.md`.
-- `docs/superpowers/specs/2026-04-16-auto-continue-design.md` kept
-  as an example of the design-first flow.
 
 ### Testing
 
@@ -141,11 +153,11 @@ Security hardening release aligned with `claude_tg_quality_criteria.md`.
 
 ### Known follow-ups (not blocking 0.2.0)
 
-- Handler split (criterion 4.1): `bot/telegram_handler.py` is still a
-  2000-line file. Needs handler-level tests first to refactor safely.
-- Coverage to the 70% target: blocked on the handler split.
-- `/update` origin-URL allowlist (criterion 11 from the review): the
-  bot currently trusts whatever `origin` is configured.
+- Handler split: `bot/telegram_handler.py` is still a 2000-line file.
+  Needs handler-level tests first to refactor safely.
+- Test coverage (~30%) — blocked on the handler split.
+- `/update` origin-URL allowlist: the bot currently trusts whatever
+  `origin` is configured.
 
 ## [0.1.0] — initial release
 

@@ -44,4 +44,3 @@ DOCS
   README.md         — full guide with diagrams and command reference
   SECURITY.md       — threat model, access / sandboxing / file rules
   CHANGELOG.md      — release notes
-  docs/superpowers/ — design specs for large features

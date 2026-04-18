@@ -21,7 +21,8 @@ ARCHITECTURE.md
 CLAUDE.md
 IMPLEMENTATION.md
 description.md
-.claude/settings.local.json
+.claude/
+docs/superpowers/
 .coverage
 coverage.xml
 htmlcov/

@@ -228,6 +228,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         "*🛠 Диагностика*\n"
         "`/botstatus` \\— аптайм, активные процессы, сводка\n"
+        "`/lastlog [name]` \\— последние 3 сообщения watcher по сессиям\n"
         "`/debug` \\— состояние провайдеров, WSL\\-дистрибутивов, путей\n"
         "`/update` \\— проверить обновления бота"
     )
@@ -2014,6 +2015,72 @@ async def cmd_botstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _safe_reply(update.message, "\n".join(lines))
 
 
+_MAX_LASTLOG_PREVIEW = 600
+
+
+def _format_lastlog_entry(ts: datetime, text: str) -> str:
+    """Render one watcher-log entry (timestamp + truncated preview, escaped)."""
+    local_ts = ts.astimezone().strftime("%H:%M:%S")
+    preview = text if len(text) <= _MAX_LASTLOG_PREVIEW else text[:_MAX_LASTLOG_PREVIEW] + "…"
+    return f"`{local_ts}` {escape_markdown_v2(preview)}"
+
+
+@authorized
+async def cmd_lastlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /lastlog [name] — show the last few watcher-observed messages.
+
+    Without args, lists entries for every session the watcher has touched.
+    With a name, shows only that session's rolling log.
+    """
+    session_mgr: SessionManager = context.bot_data["session_mgr"]
+
+    if context.args:
+        from bot import db as db_module
+
+        name = " ".join(context.args)
+        db_session = await db_module.get_session_by_name(session_mgr.conn, name)
+        if not db_session:
+            await _safe_reply(
+                update.message,
+                f"Сессия `{escape_markdown_v2(name)}` не найдена\\.",
+            )
+            return
+        entries = session_mgr.get_recent_messages(db_session["id"])
+        if not entries:
+            await _safe_reply(
+                update.message,
+                f"Для `{escape_markdown_v2(name)}` watcher пока ничего не записал\\.",
+            )
+            return
+        lines = [f"*Последние {len(entries)} сообщений* `{escape_markdown_v2(name)}`:"]
+        for ts, _sess_name, text in entries:
+            lines.append("")
+            lines.append(_format_lastlog_entry(ts, text))
+        await _safe_reply(update.message, "\n".join(lines))
+        return
+
+    all_entries = session_mgr.all_recent_messages()
+    if not all_entries:
+        await _safe_reply(
+            update.message,
+            "Watcher пока ничего не записал\\. "
+            "Лог появится, когда подключённая сессия ответит в терминале\\.",
+        )
+        return
+
+    lines = ["*Последние сообщения от watcher:*"]
+    for session_id, entries in all_entries.items():
+        if not entries:
+            continue
+        session_name = entries[-1][1]
+        lines.append("")
+        lines.append(f"\U0001f4dd `{escape_markdown_v2(session_name)}`")
+        for ts, _sess_name, text in entries:
+            lines.append(_format_lastlog_entry(ts, text))
+
+    await _safe_reply(update.message, "\n".join(lines))
+
+
 @authorized
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /debug — show provider diagnostics."""
@@ -2069,6 +2136,10 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     # Set up watcher callback — forwards terminal responses to owner + viewers
     async def on_terminal_response(session_id: str, session_name: str, text: str):
         from bot import db as db_module
+
+        # Always record into the rolling watcher log, even when there are no
+        # owners to notify — /lastlog can still surface it later.
+        session_mgr.record_watcher_message(session_id, session_name, text)
 
         conn = app.bot_data.get("db_conn")
         owner_ids = config.allowed_chat_ids
@@ -2163,6 +2234,7 @@ def setup_handlers(app: Application, session_mgr: SessionManager, config: Config
     app.add_handler(CommandHandler("viewers", cmd_viewers))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("botstatus", cmd_botstatus))
+    app.add_handler(CommandHandler("lastlog", cmd_lastlog))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("ping", cmd_ping))
