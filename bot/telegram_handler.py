@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import logging
 import os
@@ -327,16 +328,13 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /sessions — show bot sessions + terminal sessions."""
     session_mgr: SessionManager = context.bot_data["session_mgr"]
 
-    # Bot-managed sessions (from DB)
-    db_sessions = await session_mgr.list_sessions()
-
-    # Terminal sessions (from providers)
-    terminal_sessions = []
+    # Bot-managed sessions (from DB) + terminal sessions (from providers, in parallel).
+    db_sessions, all_terminal = await asyncio.gather(
+        session_mgr.list_sessions(),
+        session_mgr.list_terminal_sessions(),
+    )
     db_ids = {s["id"] for s in db_sessions}
-    for provider in session_mgr._providers.values():
-        for s in provider.list_sessions():
-            if s.session_id not in db_ids:
-                terminal_sessions.append(s)
+    terminal_sessions = [s for s in all_terminal if s.session_id not in db_ids]
 
     lines = []
 
@@ -940,9 +938,7 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Handle /connect — show terminal sessions from all providers as inline buttons."""
     session_mgr: SessionManager = context.bot_data["session_mgr"]
 
-    all_sessions = []
-    for provider in session_mgr._providers.values():
-        all_sessions.extend(provider.list_sessions())
+    all_sessions = await session_mgr.list_terminal_sessions()
 
     if not all_sessions:
         await update.message.reply_text(
@@ -2028,7 +2024,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for name, provider in session_mgr._providers.items():
         lines.append(f"*{escape_markdown_v2(name)}:*")
         try:
-            sessions = provider.list_sessions()
+            sessions = await asyncio.to_thread(provider.list_sessions)
             lines.append(f"  Найдено сессий: {len(sessions)}")
             for s in sessions[:5]:
                 wsl = f" WSL/{escape_markdown_v2(s.wsl_distro)}" if s.wsl_distro else ""

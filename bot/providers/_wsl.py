@@ -11,11 +11,17 @@ import os
 import platform
 import shutil as _shutil
 import subprocess as _subprocess
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _wsl_unc_prefix_cache: dict[str, str] = {}
+
+# `wsl.exe -l -q` spawn costs ~200-500ms on Windows; distros list rarely
+# changes, so cache it for a short TTL to keep /sessions and /connect snappy.
+_WSL_DISTROS_TTL_SECONDS = 60.0
+_wsl_distros_cache: tuple[float, list[str]] | None = None
 
 
 def find_wsl_exe() -> str:
@@ -48,9 +54,17 @@ def resolve_wsl_cli(distro: str, cli_name: str) -> str:
 
 
 def get_wsl_distros() -> list[str]:
-    """Return installed WSL distribution names."""
+    """Return installed WSL distribution names (cached for 60s)."""
     if platform.system() != "Windows":
         return []
+
+    global _wsl_distros_cache
+    now = time.monotonic()
+    if _wsl_distros_cache is not None:
+        ts, cached = _wsl_distros_cache
+        if now - ts < _WSL_DISTROS_TTL_SECONDS:
+            return cached
+
     wsl = find_wsl_exe()
     try:
         result = _subprocess.run(
@@ -58,18 +72,28 @@ def get_wsl_distros() -> list[str]:
             capture_output=True, timeout=10,
         )
         if result.returncode != 0:
-            return []
-        try:
-            text = result.stdout.decode("utf-16-le")
-        except UnicodeDecodeError:
-            text = result.stdout.decode("utf-8", errors="replace")
-        return [
-            line.strip().strip("\x00")
-            for line in text.strip().split("\n")
-            if line.strip().strip("\x00")
-        ]
+            distros: list[str] = []
+        else:
+            try:
+                text = result.stdout.decode("utf-16-le")
+            except UnicodeDecodeError:
+                text = result.stdout.decode("utf-8", errors="replace")
+            distros = [
+                line.strip().strip("\x00")
+                for line in text.strip().split("\n")
+                if line.strip().strip("\x00")
+            ]
     except (FileNotFoundError, _subprocess.TimeoutExpired, OSError):
-        return []
+        distros = []
+
+    _wsl_distros_cache = (now, distros)
+    return distros
+
+
+def invalidate_wsl_distros_cache() -> None:
+    """Drop the cached WSL distros list (call after known WSL state changes)."""
+    global _wsl_distros_cache
+    _wsl_distros_cache = None
 
 
 @functools.lru_cache(maxsize=16)

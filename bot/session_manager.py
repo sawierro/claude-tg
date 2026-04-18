@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from pathlib import Path
@@ -6,7 +7,7 @@ import aiosqlite
 
 from bot import db
 from bot.config import Config
-from bot.providers.base import CLIProvider, ProviderResponse
+from bot.providers.base import CLIProvider, ProviderResponse, ProviderSession
 from bot.session_watcher import SessionWatcher
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,31 @@ class SessionManager:
         if not provider:
             raise ValueError(f"Unknown provider: {name}")
         return provider
+
+    async def list_terminal_sessions(self) -> list[ProviderSession]:
+        """Scan every provider for terminal sessions in parallel, off the event loop.
+
+        `provider.list_sessions()` is synchronous and can spawn `wsl.exe`
+        plus do UNC-path I/O, each taking hundreds of ms. Running them via
+        `asyncio.to_thread` + `gather` keeps the bot responsive and turns
+        N sequential scans into one.
+        """
+        providers = list(self._providers.values())
+        if not providers:
+            return []
+        results = await asyncio.gather(
+            *(asyncio.to_thread(p.list_sessions) for p in providers),
+            return_exceptions=True,
+        )
+        merged: list[ProviderSession] = []
+        for provider, result in zip(providers, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Provider %s list_sessions failed: %s", provider.name, result
+                )
+                continue
+            merged.extend(result)
+        return merged
 
     def set_watcher_callback(self, callback) -> None:
         """Set callback for watcher notifications: async fn(session_id, name, text)."""
